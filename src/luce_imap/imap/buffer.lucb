@@ -1,0 +1,222 @@
+#==============================================================================================
+#
+#   imap/buffer - Growable bytes and numbers
+#
+#   DESCRIPTION:
+#       Both grow on the heap by doubling. A view lasts until the next append: results a
+#       session hands out are views into buffers it reuses for the next command.
+#
+#==============================================================================================
+
+## A growable run of bytes.
+pub struct Bytes:
+    var data: u8[]
+    var used: usize
+
+    mutating func reserve(extra: usize) -> !:
+        let needed = self.used +? extra else error(limit_exceeded, "the buffer is too large")
+        if needed <= self.data.length:
+            return
+        var capacity: usize = 256 if self.data.length == 0 else self.data.length * 2
+        while capacity < needed:
+            capacity *= 2
+        let grown = try new u8[capacity] in memory.heap
+        memory.copy(grown, self.data, self.used)
+        if self.data.length > 0:
+            free(self.data) in memory.heap
+        self.data = grown
+
+    ## Append `data`.
+    pub mutating func put(data: const u8[]) -> !:
+        try self.reserve(data.length)
+        memory.copy(self.data[self.used..], data, data.length)
+        self.used += data.length
+
+    ## Append `text`.
+    pub mutating func text(text: str) -> !:
+        try self.put(text.bytes)
+
+    ## Append one byte.
+    pub mutating func byte(value: u8) -> !:
+        if self.used == self.data.length:
+            try self.reserve(1)
+        self.data[self.used] = value
+        self.used += 1
+
+    ## Append `value` in decimal.
+    pub mutating func number(value: u64) -> !:
+        var digits: u8[20]
+        var count: usize = 0
+        var rest = value
+        while rest > 0 or count == 0:
+            digits[count] = (u8)(rest % 10) + '0'
+            rest = rest // 10
+            count += 1
+        while count > 0:
+            count -= 1
+            try self.byte(digits[count])
+
+    ## The bytes so far, valid until the next append.
+    pub func view() -> const u8[]:
+        return self.data[0..<self.used]
+
+    ## Forget the contents, keeping the storage.
+    pub mutating func clear():
+        self.used = 0
+
+    ## Give the storage back.
+    pub mutating func close():
+        if self.data.length > 0:
+            free(self.data) in memory.heap
+        var empty: u8[]
+        self.data = empty
+        self.used = 0
+
+## A growable list of `u32`: UIDs, sequence numbers.
+pub struct Words:
+    var data: u32[]
+    var used: usize
+
+    ## Append `value`.
+    pub mutating func add(value: u32) -> !:
+        if self.used == self.data.length:
+            let capacity: usize = 64 if self.data.length == 0 else self.data.length * 2
+            let grown = try new u32[capacity] in memory.heap
+            memory.copy(grown, self.data, self.used)
+            if self.data.length > 0:
+                free(self.data) in memory.heap
+            self.data = grown
+        self.data[self.used] = value
+        self.used += 1
+
+    ## The values so far, valid until the next append.
+    pub func view() -> const u32[]:
+        return self.data[0..<self.used]
+
+    ## Forget the contents, keeping the storage.
+    pub mutating func clear():
+        self.used = 0
+
+    ## Give the storage back.
+    pub mutating func close():
+        if self.data.length > 0:
+            free(self.data) in memory.heap
+        var empty: u32[]
+        self.data = empty
+        self.used = 0
+
+## The ASCII lower case of `byte`.
+func lower(byte: u8) -> u8:
+    return byte + 32 if byte >= 'A' and byte <= 'Z' else byte
+
+## Whether `a` and `b` are equal ignoring ASCII case.
+pub func same(a: const u8[], b: const u8[]) -> bool:
+    if a.length != b.length:
+        return false
+    for index in 0..<a.length:
+        if lower(a[index]) != lower(b[index]):
+            return false
+    return true
+
+## Whether `text` starts with `prefix` ignoring ASCII case.
+func starts(text: const u8[], prefix: const u8[]) -> bool:
+    return text.length >= prefix.length and same(text[0..<prefix.length], prefix)
+
+## The size of an ordinary TextPool chunk; a larger request gets a chunk of its own.
+let chunk_size: usize = 16384
+
+## Bytes kept at stable addresses until `close`: the text of a command's results.
+pub struct TextPool:
+    var chunks: u8[][]
+    var count: usize
+    var used: usize
+
+    ## A kept copy of `data`, which stays where it is until the pool closes.
+    pub mutating func keep(data: const u8[]) -> const u8[]!:
+        if data.length == 0:
+            var empty: const u8[]
+            return empty
+        if self.count == 0 or self.chunks[self.count - 1].length - self.used < data.length:
+            if self.count == self.chunks.length:
+                let capacity: usize = 8 if self.chunks.length == 0 else self.chunks.length * 2
+                let grown = try new (u8[])[capacity] in memory.heap
+                for index in 0..<self.count:
+                    grown[index] = self.chunks[index]
+                if self.chunks.length > 0:
+                    free(self.chunks) in memory.heap
+                self.chunks = grown
+            self.chunks[self.count] = try new u8[data.length if data.length > chunk_size else chunk_size] in memory.heap
+            self.count += 1
+            self.used = 0
+        let room = self.chunks[self.count - 1][self.used..<self.used + data.length]
+        memory.copy(room, data, data.length)
+        self.used += data.length
+        return room
+
+    ## Give every chunk back; earlier views become invalid.
+    pub mutating func close():
+        for index in 0..<self.count:
+            free(self.chunks[index]) in memory.heap
+        if self.chunks.length > 0:
+            free(self.chunks) in memory.heap
+        var empty: u8[][]
+        self.chunks = empty
+        self.count = 0
+        self.used = 0
+
+let base64_letters: str = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+
+## Append `data` in base64 on one line, as SASL wants it.
+func put_base64(data: const u8[], out: Bytes*) -> !:
+    let letters = base64_letters.bytes
+    var index: usize = 0
+    while index < data.length:
+        let remaining = data.length - index
+        var group: u32 = (u32)data[index] << 16
+        if remaining > 1:
+            group |= (u32)data[index + 1] << 8
+        if remaining > 2:
+            group |= data[index + 2]
+        try out.byte(letters[(group >> 18) & 63])
+        try out.byte(letters[(group >> 12) & 63])
+        try out.byte(letters[(group >> 6) & 63] if remaining > 1 else '=')
+        try out.byte(letters[group & 63] if remaining > 2 else '=')
+        index += 3 if remaining >= 3 else remaining
+
+## A growable list of plain records: mailboxes, fetched messages.
+pub struct Records[T]:
+    var data: T[]
+    var used: usize
+
+    ## Append `value`.
+    pub mutating func add(value: T) -> !:
+        if self.used == self.data.length:
+            let capacity: usize = 16 if self.data.length == 0 else self.data.length * 2
+            let grown = try alloc T[capacity] in memory.heap
+            for index in 0..<self.used:
+                grown[index] = self.data[index]
+            if self.data.length > 0:
+                free(self.data) in memory.heap
+            self.data = grown
+        self.data[self.used] = value
+        self.used += 1
+
+    ## The records so far, valid until the next append.
+    pub func view() -> const T[]:
+        return self.data[0..<self.used]
+
+    ## How many records there are.
+    pub func length() -> usize:
+        return self.used
+
+    ## Forget the records, keeping the storage.
+    pub mutating func clear():
+        self.used = 0
+
+    ## Give the storage back.
+    pub mutating func close():
+        if self.data.length > 0:
+            free(self.data) in memory.heap
+        var empty: T[]
+        self.data = empty
+        self.used = 0

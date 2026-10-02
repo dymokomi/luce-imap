@@ -1,0 +1,497 @@
+#==============================================================================================
+#
+#   imap/response - One response, read off the wire and parsed
+#
+#   DESCRIPTION:
+#       A response is a line, with literals (`{n}` CRLF and n bytes) inline. The Reader
+#       buffers what the link delivers and hands out one whole response at a time.
+#       Response.parse reads it: the tag (`*`, `+` or a command's), then either a status
+#       (OK, NO, BAD, BYE, PREAUTH) with an optional `[code args]` and its text, or a
+#       name with data (`* 23 EXISTS`, `* CAPABILITY …`, `* 4 FETCH (…)`). Data values are
+#       atoms, numbers, strings (quoted or literal), NIL and parenthesised lists, kept as
+#       a tree of nodes over the response's bytes. Atoms keep a bracketed section whole,
+#       so `BODY[HEADER.FIELDS (DATE FROM)]<0>` is one atom.
+#
+#==============================================================================================
+
+## The most nodes one response may hold.
+let maximum_nodes: usize = 1 << 22
+
+## What a node is.
+pub enum Kind as u8:
+    atom = 0
+    number = 1
+    string = 2
+    nil = 3
+    list = 4
+
+## One value of a response: its bytes, or its children.
+struct Node:
+    var kind: Kind
+    var start: usize
+    var end: usize
+    ## A quoted string holding backslash escapes.
+    var escaped: bool
+    ## The first child of a list and the next sibling, as index + 1; zero for none.
+    var child: u32
+    var next: u32
+    var count: u32
+
+## The status a response carries.
+pub enum Status as u8:
+    ## Data, not a status: `* 23 EXISTS`, `* LIST …`, a continuation.
+    data = 0
+    ok = 1
+    no = 2
+    bad = 3
+    bye = 4
+    preauth = 5
+
+## A parsed response. Views point into the reader's buffer and the node table; both
+## last until the next response is read.
+pub struct Response:
+    var raw: const u8[]
+    var nodes: Node[]
+    var node_count: usize
+    pub var tag: const u8[]
+    pub var status: Status
+    ## The number before the name in `* 23 EXISTS`.
+    pub var number: u32?
+    ## `OK`, `EXISTS`, `FETCH`, `LIST`, …; empty for a continuation.
+    pub var name: const u8[]
+    ## The response code (`UIDVALIDITY`) and the list node of its arguments.
+    pub var code: const u8[]
+    pub var code_values: usize
+    ## Human-readable text after a status or a continuation.
+    pub var text: const u8[]
+    ## The list node holding the data after the name.
+    pub var values: usize
+
+    ## Whether this is a continuation request, `+ …`.
+    pub func is_continuation() -> bool:
+        return self.tag.length == 1 and self.tag[0] == '+'
+
+    ## Whether this is untagged, `* …`.
+    pub func is_untagged() -> bool:
+        return self.tag.length == 1 and self.tag[0] == '*'
+
+    ## Whether the name is `name`, ignoring case.
+    pub func is(name: str) -> bool:
+        return same(self.name, name.bytes)
+
+    # mark: nodes ================================================================================
+
+    ## The kind of node `node`.
+    pub func kind(node: usize) -> Kind:
+        return self.nodes[node].kind
+
+    ## The first child of list `node`, or none.
+    pub func first(node: usize) -> usize?:
+        let child = self.nodes[node].child
+        return none if child == 0 else (usize)child - 1
+
+    ## The node after `node` in its list, or none.
+    pub func next(node: usize) -> usize?:
+        let sibling = self.nodes[node].next
+        return none if sibling == 0 else (usize)sibling - 1
+
+    ## The child at `index` of list `node`, or none.
+    pub func at(node: usize, index: usize) -> usize?:
+        var current = self.first(node)
+        var step: usize = 0
+        while let child = current:
+            if step == index:
+                return child
+            current = self.next(child)
+            step += 1
+        return none
+
+    ## How many children list `node` has.
+    pub func count(node: usize) -> usize:
+        return self.nodes[node].count
+
+    ## The bytes of an atom, number or string node; a quoted string as written, escapes
+    ## and all (see `string`).
+    pub func bytes(node: usize) -> const u8[]:
+        return self.raw[self.nodes[node].start..<self.nodes[node].end]
+
+    ## Append string, atom or number `node`'s text, unescaped; NIL appends nothing.
+    pub func string(node: usize, out: Bytes*) -> !:
+        let entry = self.nodes[node]
+        if entry.kind == Kind.nil or entry.kind == Kind.list:
+            return
+        let data = self.raw[entry.start..<entry.end]
+        if not entry.escaped:
+            try out.put(data)
+            return
+        var index: usize = 0
+        while index < data.length:
+            if data[index] == '\\' and index + 1 < data.length:
+                index += 1
+            try out.byte(data[index])
+            index += 1
+
+    ## The value of a number node, or none for anything else.
+    pub func number_of(node: usize) -> u64?:
+        if self.nodes[node].kind != Kind.number:
+            return none
+        var value: u64 = 0
+        for digit in self.bytes(node):
+            value = (value *? 10 else return none) +? (u64)(digit - '0') else return none
+        return value
+
+    ## Whether node `node` is the atom `name`, ignoring case.
+    pub func is_atom(node: usize, name: str) -> bool:
+        return self.nodes[node].kind == Kind.atom and same(self.bytes(node), name.bytes)
+
+    # mark: parsing ==============================================================================
+
+    mutating func add(kind: Kind, start: usize, end: usize) -> usize!:
+        if self.node_count == self.nodes.length:
+            if self.node_count >= maximum_nodes:
+                error(limit_exceeded, "the response has too many values")
+            let capacity: usize = 64 if self.nodes.length == 0 else self.nodes.length * 2
+            let grown = try alloc Node[capacity] in memory.heap
+            for index in 0..<self.node_count:
+                grown[index] = self.nodes[index]
+            if self.nodes.length > 0:
+                free(self.nodes) in memory.heap
+            self.nodes = grown
+        self.nodes[self.node_count] = Node(kind = kind, start = start, end = end, escaped = false, child = 0, next = 0, count = 0)
+        self.node_count += 1
+        return self.node_count - 1
+
+    ## Make `child` the last child of list `list`, after `last` (none when it is first).
+    mutating func link(list: usize, last: usize?, child: usize):
+        if let previous = last:
+            self.nodes[previous].next = u32(child + 1)
+        else:
+            self.nodes[list].child = u32(child + 1)
+        self.nodes[list].count += 1
+
+    ## Parse `raw`, one whole response with its CRLF. Views point into `raw`.
+    pub mutating func parse(raw: const u8[]) -> !:
+        self.raw = raw
+        self.node_count = 0
+        self.status = Status.data
+        self.number = none
+        var empty: const u8[]
+        self.tag = empty
+        self.name = empty
+        self.code = empty
+        self.text = empty
+        self.values = try self.add(Kind.list, 0, 0)
+        self.code_values = try self.add(Kind.list, 0, 0)
+        var cursor = Cursor(data = raw, index = 0)
+        self.tag = cursor.word()
+        if self.tag.length == 0:
+            error(protocol, "a response without a tag")
+        if self.is_continuation():
+            cursor.space()
+            self.text = cursor.rest()
+            return
+        cursor.space()
+        if self.is_untagged() and cursor.digit():
+            let digits = cursor.word()
+            var value: u32 = 0
+            for digit in digits:
+                if digit < '0' or digit > '9':
+                    error(protocol, "a malformed message number")
+                value = (value *? 10 else error(protocol, "a message number too large")) + (u32)(digit - '0')
+            self.number = value
+            cursor.space()
+        self.name = cursor.word()
+        let status = status_of(self.name)
+        if status != Status.data:
+            self.status = status
+            cursor.space()
+            if cursor.peek() == '[':
+                cursor.index += 1
+                self.code = cursor.code_atom()
+                var last: usize? = none
+                while true:
+                    cursor.space()
+                    let next = cursor.peek()
+                    if next == ']' or next == 0:
+                        break
+                    let value = try self.value(&cursor, true)
+                    self.link(self.code_values, last, value)
+                    last = value
+                if cursor.peek() == ']':
+                    cursor.index += 1
+                cursor.space()
+            self.text = cursor.rest()
+            return
+        var last: usize? = none
+        while true:
+            cursor.space()
+            if cursor.at_end():
+                break
+            let value = try self.value(&cursor, false)
+            self.link(self.values, last, value)
+            last = value
+
+    ## Parse the value at the cursor; in a response code `]` ends an atom.
+    mutating func value(cursor: Cursor*, in_code: bool) -> usize!:
+        let byte = cursor.peek()
+        if byte == '(':
+            cursor.index += 1
+            let list = try self.add(Kind.list, cursor.index, cursor.index)
+            var last: usize? = none
+            while true:
+                cursor.space()
+                let next = cursor.peek()
+                if next == ')':
+                    cursor.index += 1
+                    break
+                if cursor.at_end():
+                    error(protocol, "a list without its closing parenthesis")
+                let child = try self.value(cursor, in_code)
+                self.link(list, last, child)
+                last = child
+            self.nodes[list].end = cursor.index
+            return list
+        if byte == '"':
+            cursor.index += 1
+            let start = cursor.index
+            var escaped = false
+            while cursor.index < cursor.data.length and cursor.data[cursor.index] != '"':
+                if cursor.data[cursor.index] == '\\':
+                    escaped = true
+                    cursor.index += 1
+                cursor.index += 1
+            if cursor.index >= cursor.data.length:
+                error(protocol, "a quoted string without its closing quote")
+            let node = try self.add(Kind.string, start, cursor.index)
+            self.nodes[node].escaped = escaped
+            cursor.index += 1
+            return node
+        if byte == '{':
+            cursor.index += 1
+            var length: usize = 0
+            while cursor.index < cursor.data.length and cursor.data[cursor.index] >= '0' and cursor.data[cursor.index] <= '9':
+                length = (length *? 10 else error(protocol, "a literal too large")) + (usize)(cursor.data[cursor.index] - '0')
+                cursor.index += 1
+            if cursor.index < cursor.data.length and cursor.data[cursor.index] == '+':
+                cursor.index += 1
+            if not cursor.expect(b"}\r\n"):
+                error(protocol, "a malformed literal")
+            let start = cursor.index
+            if length > cursor.data.length - start:
+                error(protocol, "a literal longer than the response")
+            cursor.index += length
+            return try self.add(Kind.string, start, start + length)
+        let atom = cursor.atom(in_code)
+        if atom.length == 0:
+            error(protocol, "an unexpected character in a response")
+        let start = cursor.index - atom.length
+        if same(atom, b"NIL"):
+            return try self.add(Kind.nil, start, cursor.index)
+        var digits = true
+        for digit in atom:
+            if digit < '0' or digit > '9':
+                digits = false
+        return try self.add(Kind.number if digits else Kind.atom, start, cursor.index)
+
+    ## Give the node table back.
+    pub mutating func close():
+        if self.nodes.length > 0:
+            free(self.nodes) in memory.heap
+        var empty: Node[]
+        self.nodes = empty
+        self.node_count = 0
+
+## The status named `name`, or none.
+func status_of(name: const u8[]) -> Status:
+    if same(name, b"OK"):
+        return Status.ok
+    if same(name, b"NO"):
+        return Status.no
+    if same(name, b"BAD"):
+        return Status.bad
+    if same(name, b"BYE"):
+        return Status.bye
+    if same(name, b"PREAUTH"):
+        return Status.preauth
+    return Status.data
+
+## A position in a response's bytes.
+struct Cursor:
+    var data: const u8[]
+    var index: usize
+
+    ## The byte at the cursor; zero at the end of the line.
+    func peek() -> u8:
+        if self.index >= self.data.length:
+            return 0
+        let byte = self.data[self.index]
+        return 0 if byte == '\r' or byte == '\n' else byte
+
+    func at_end() -> bool:
+        return self.peek() == 0
+
+    func digit() -> bool:
+        let byte = self.peek()
+        return byte >= '0' and byte <= '9'
+
+    ## Skip spaces.
+    mutating func space():
+        while self.index < self.data.length and self.data[self.index] == ' ':
+            self.index += 1
+
+    ## Take `text` when it is next.
+    mutating func expect(text: const u8[]) -> bool:
+        if self.data.length - self.index >= text.length:
+            for offset in 0..<text.length:
+                if self.data[self.index + offset] != text[offset]:
+                    return false
+            self.index += text.length
+            return true
+        return false
+
+    ## The run up to the next space or line end.
+    mutating func word() -> const u8[]:
+        let start = self.index
+        while self.peek() != 0 and self.peek() != ' ':
+            self.index += 1
+        return self.data[start..<self.index]
+
+    ## A response code's name: up to a space or `]`.
+    mutating func code_atom() -> const u8[]:
+        let start = self.index
+        while self.peek() != 0 and self.peek() != ' ' and self.peek() != ']':
+            self.index += 1
+        return self.data[start..<self.index]
+
+    ## An atom: up to a space, a parenthesis or the line end, with a bracketed section
+    ## (which may hold spaces) kept whole. In a response code `]` ends it.
+    mutating func atom(in_code: bool) -> const u8[]:
+        let start = self.index
+        var depth: usize = 0
+        while true:
+            let byte = self.peek()
+            if byte == 0:
+                break
+            if depth == 0 and (byte == ' ' or byte == '(' or byte == ')' or byte == '"' or byte == '{'):
+                break
+            if byte == '[':
+                depth += 1
+            elif byte == ']':
+                if depth == 0:
+                    if in_code:
+                        break
+                else:
+                    depth -= 1
+            self.index += 1
+        return self.data[start..<self.index]
+
+    ## The rest of the line.
+    mutating func rest() -> const u8[]:
+        let start = self.index
+        while self.peek() != 0:
+            self.index += 1
+        return self.data[start..<self.index]
+
+## Buffers what the link delivers and hands out whole responses.
+pub struct Reader:
+    var buffer: Bytes
+    ## Where the unread bytes start in the buffer.
+    var start: usize
+    ## The last response read: its line and literals.
+    var current: Bytes
+
+    ## Read one whole response from `link` into `current`.
+    pub mutating func read(link: Link*) -> const u8[]!:
+        self.current.clear()
+        while true:
+            let line_start = self.current.used
+            try self.line(link)
+            let line = self.current.view()[line_start..]
+            # A line ending `{n}` or `{n+}` is followed by n bytes, then more line.
+            let length = literal_length(line) else return self.current.view()
+            try self.exactly(link, length)
+
+    ## Append one line, CRLF included, to `current`.
+    mutating func line(link: Link*) -> !:
+        # Bytes after `start` already searched for the line end.
+        var searched: usize = 0
+        while true:
+            let data = self.buffer.view()
+            var index = self.start + searched
+            while index < data.length and data[index] != '\n':
+                index += 1
+            if index < data.length:
+                try self.current.put(data[self.start..<index + 1])
+                self.start = index + 1
+                if self.current.used > maximum_line + maximum_literal:
+                    error(limit_exceeded, "the response is too long")
+                return
+            searched = data.length - self.start
+            if searched > maximum_line:
+                error(limit_exceeded, "a response line is too long")
+            try self.fill(link)
+
+    ## Append exactly `count` bytes to `current`.
+    mutating func exactly(link: Link*, count: usize) -> !:
+        if count > maximum_literal:
+            error(limit_exceeded, "a literal is larger than this client accepts")
+        var remaining = count
+        while remaining > 0:
+            let available = self.buffer.used - self.start
+            if available == 0:
+                try self.fill(link)
+                continue
+            let take = available if available < remaining else remaining
+            try self.current.put(self.buffer.view()[self.start..<self.start + take])
+            self.start += take
+            remaining -= take
+
+    ## Read more from `link`, first moving the unread bytes to the front.
+    mutating func fill(link: Link*) -> !:
+        if self.start > 0:
+            let unread = self.buffer.used - self.start
+            memory.move(self.buffer.data, self.buffer.data[self.start..], unread)
+            self.buffer.used = unread
+            self.start = 0
+        try self.buffer.reserve(65536)
+        let count = try link.read(self.buffer.data[self.buffer.used..])
+        if count == 0:
+            error(disconnected, "the server closed the connection")
+        self.buffer.used += count
+
+    ## Whether bytes are waiting that were read but not handed out.
+    pub func pending() -> bool:
+        return self.start < self.buffer.used
+
+    ## Give the buffers back.
+    pub mutating func close():
+        self.buffer.close()
+        self.current.close()
+        self.start = 0
+
+## The length a line's trailing literal marker announces (`{12}` or `{12+}` before CRLF),
+## or none.
+func literal_length(line: const u8[]) -> usize?:
+    var end = line.length
+    if end > 0 and line[end - 1] == '\n':
+        end -= 1
+    if end > 0 and line[end - 1] == '\r':
+        end -= 1
+    if end < 3 or line[end - 1] != '}':
+        return none
+    var index = end - 1
+    if line[index - 1] == '+':
+        index -= 1
+    var length: usize = 0
+    var scale: usize = 1
+    var digits: usize = 0
+    while index > 0 and line[index - 1] >= '0' and line[index - 1] <= '9':
+        index -= 1
+        length += (usize)(line[index] - '0') * scale
+        scale *= 10
+        digits += 1
+        if digits > 10:
+            return none
+    if digits == 0 or index == 0 or line[index - 1] != '{':
+        return none
+    return length

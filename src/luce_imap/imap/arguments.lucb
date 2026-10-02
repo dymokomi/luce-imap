@@ -1,0 +1,111 @@
+#==============================================================================================
+#
+#   imap/arguments - Command arguments
+#
+#   DESCRIPTION:
+#       A Command is the text after the tag. Strings go as atoms when every byte may
+#       stand in one, as quoted strings when they are 7-bit text (or UTF-8 once the server
+#       accepts it), and as literals otherwise. A synchronizing literal (`{n}`) makes the
+#       client wait for the server's `+` before sending its bytes, so the command keeps
+#       the offsets where it must pause; with LITERAL+ (`{n+}`) it never pauses.
+#       Mailbox names are modified UTF-7 unless the server accepts UTF-8.
+#
+#==============================================================================================
+
+## Whether `byte` may stand in an atom (RFC 3501 §9 ATOM-CHAR).
+func is_atom_char(byte: u8) -> bool:
+    if byte <= 0x20 or byte >= 0x7F:
+        return false
+    return byte != '(' and byte != ')' and byte != '{' and byte != '%' and byte != '*' and byte != '"' and byte != '\\' and byte != ']'
+
+## A command being written: its text and where it pauses for the server.
+pub struct Command:
+    var text: Bytes
+    ## Offsets in `text` just after each synchronizing literal's `{n}` CRLF.
+    var cuts: Words
+    ## The server offers LITERAL+ (or LITERAL-, used here only for small literals).
+    var literal_plus: bool
+    ## The server accepts UTF-8 in quoted strings (UTF8=ACCEPT enabled).
+    var utf8: bool
+
+    ## Start a new command.
+    mutating func clear():
+        self.text.clear()
+        self.cuts.clear()
+
+    ## Append protocol text as it is: command names, keywords, parenthesised items.
+    pub mutating func raw(text: str) -> !:
+        try self.text.text(text)
+
+    ## Append a number.
+    pub mutating func number(value: u64) -> !:
+        try self.text.number(value)
+
+    ## Append `data` as a literal.
+    pub mutating func literal(data: const u8[]) -> !:
+        try self.text.byte('{')
+        try self.text.number((u64)data.length)
+        if self.literal_plus:
+            try self.text.put(b"+}\r\n")
+        else:
+            try self.text.put(b"}\r\n")
+            try self.cuts.add(u32(self.text.used))
+        try self.text.put(data)
+
+    ## Append `data` as a quoted string, or a literal when it cannot be one.
+    pub mutating func string(data: const u8[]) -> !:
+        for byte in data:
+            if byte == 0 or byte == '\r' or byte == '\n' or (byte >= 0x80 and not self.utf8):
+                try self.literal(data)
+                return
+        try self.text.byte('"')
+        for byte in data:
+            if byte == '"' or byte == '\\':
+                try self.text.byte('\\')
+            try self.text.byte(byte)
+        try self.text.byte('"')
+
+    ## Append `data` as an atom when it can be one, a string otherwise.
+    pub mutating func astring(data: const u8[]) -> !:
+        if data.length == 0:
+            try self.text.put(b"\"\"")
+            return
+        for byte in data:
+            if not is_atom_char(byte):
+                try self.string(data)
+                return
+        try self.text.put(data)
+
+    ## Append UTF-8 mailbox name `name`, encoded as the server wants it.
+    pub mutating func mailbox(name: const u8[]) -> !:
+        if same(name, b"INBOX") or self.utf8:
+            try self.astring(name)
+            return
+        var encoded: Bytes
+        defer encoded.close()
+        try encode_mailbox(name, &encoded)
+        try self.astring(encoded.view())
+
+    ## Give the buffers back.
+    mutating func close():
+        self.text.close()
+        self.cuts.close()
+
+## Append ascending `values` as a compact sequence set: `1:4,7,9:10`.
+pub func write_set(values: const u32[], out: Bytes*) -> !:
+    var index: usize = 0
+    var written = false
+    while index < values.length:
+        let first = values[index]
+        var last = first
+        while index + 1 < values.length and values[index + 1] == last + 1:
+            index += 1
+            last = values[index]
+        if written:
+            try out.byte(',')
+        written = true
+        try out.number(first)
+        if last != first:
+            try out.byte(':')
+            try out.number(last)
+        index += 1

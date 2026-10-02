@@ -1,0 +1,133 @@
+#==============================================================================================
+#
+#   imap/tests_parse - Responses parsed, mailbox names, sets and dates
+#
+#==============================================================================================
+
+## `text` parsed into `response`.
+func parsed(text: str, response: Response*) -> !:
+    try response.parse(text.bytes)
+
+test "status responses with codes and text":
+    var response: Response
+    defer response.close()
+    try parsed("* OK [UIDVALIDITY 3857529045] UIDs valid\r\n", &response)
+    assert(response.is_untagged() and response.status == Status.ok)
+    assert(equal(response.code, b"UIDVALIDITY"))
+    assert(response.number_of(response.first(response.code_values) else trap("arg")) == 3857529045)
+    assert(equal(response.text, b"UIDs valid"))
+    try parsed("a7 NO [AUTHENTICATIONFAILED] Invalid credentials (Failure)\r\n", &response)
+    assert(equal(response.tag, b"a7") and response.status == Status.no)
+    assert(equal(response.code, b"AUTHENTICATIONFAILED"))
+    try parsed("* OK [PERMANENTFLAGS (\\Deleted \\Seen \\*)] Limited\r\n", &response)
+    let flags = response.first(response.code_values) else trap("flags")
+    assert(response.kind(flags) == Kind.list and response.count(flags) == 3)
+    try parsed("+ idling\r\n", &response)
+    assert(response.is_continuation() and equal(response.text, b"idling"))
+    try parsed("* BYE Autologout; idle for too long\r\n", &response)
+    assert(response.status == Status.bye)
+
+test "data responses: EXISTS, LIST, SEARCH, STATUS":
+    var response: Response
+    defer response.close()
+    try parsed("* 172 EXISTS\r\n", &response)
+    assert(response.is("EXISTS") and response.number == 172)
+    try parsed("* LIST (\\HasNoChildren \\Sent) \"/\" \"Sent Items\"\r\n", &response)
+    assert(response.is("LIST") and response.count(response.values) == 3)
+    var name: Bytes
+    defer name.close()
+    try response.string(response.at(response.values, 2) else trap("name"), &name)
+    assert(equal(name.view(), b"Sent Items"))
+    try parsed("* LIST () NIL INBOX\r\n", &response)
+    assert(response.kind(response.at(response.values, 1) else trap("nil")) == Kind.nil)
+    try parsed("* SEARCH 2 84 882\r\n", &response)
+    assert(response.count(response.values) == 3)
+    try parsed("* STATUS \"a \\\"b\\\"\" (MESSAGES 231 UIDNEXT 44292)\r\n", &response)
+    name.clear()
+    try response.string(response.at(response.values, 0) else trap("status name"), &name)
+    assert(equal(name.view(), b"a \"b\""))
+
+test "FETCH with sections, literals and NIL":
+    var response: Response
+    defer response.close()
+    try parsed("* 12 FETCH (UID 99 FLAGS (\\Seen $Forwarded) RFC822.SIZE 4286 INTERNALDATE \"17-Jul-1996 02:44:25 -0700\" BODY[HEADER.FIELDS (DATE FROM)] {13}\r\nFrom: a@b.c\r\n BODY[TEXT] NIL)\r\n", &response)
+    assert(response.is("FETCH") and response.number == 12)
+    let items = response.first(response.values) else trap("items")
+    assert(response.count(items) == 12)
+    let section = response.at(items, 8) else trap("section")
+    assert(equal(response.bytes(section), b"BODY[HEADER.FIELDS (DATE FROM)]"))
+    let literal = response.at(items, 9) else trap("literal")
+    assert(response.kind(literal) == Kind.string and equal(response.bytes(literal), b"From: a@b.c\r\n"))
+    assert(response.kind(response.at(items, 11) else trap("nil")) == Kind.nil)
+
+test "malformed responses fail without crashing":
+    var response: Response
+    defer response.close()
+    var failures: usize = 0
+    for text in ["\r\n", "* 1 FETCH (UID 1\r\n", "* LIST (\\A) \"/\" \"open\r\n", "* 1 FETCH (BODY[] {99}\r\nshort)\r\n"]:
+        response.parse(text.bytes) catch failure:
+            assert(failure.code == protocol)
+            failures += 1
+            continue
+    assert(failures == 4)
+
+test "the literal marker at a line end":
+    assert(literal_length(b"* 1 FETCH (BODY[] {120}\r\n") == 120)
+    assert(literal_length(b"a1 APPEND x {5+}\r\n") == 5)
+    assert(literal_length(b"* OK {not}\r\n") == none)
+    assert(literal_length(b"* OK fine\r\n") == none)
+
+test "modified UTF-7 mailbox names both ways":
+    var out: Bytes
+    defer out.close()
+    try decode_mailbox(b"Entw&APw-rfe", &out)
+    assert((str)out.view() == "Entwürfe")
+    out.clear()
+    try decode_mailbox(b"~peter/mail/&U,BTFw-/&ZeVnLIqe-", &out)
+    assert((str)out.view() == "~peter/mail/台北/日本語")
+    out.clear()
+    try decode_mailbox(b"A&-B &broken", &out)
+    assert((str)out.view() == "A&B &broken")
+    out.clear()
+    try encode_mailbox("~peter/mail/台北/日本語".bytes, &out)
+    assert((str)out.view() == "~peter/mail/&U,BTFw-/&ZeVnLIqe-")
+    out.clear()
+    try encode_mailbox("Fish & Chips 🐟".bytes, &out)
+    var back: Bytes
+    defer back.close()
+    try decode_mailbox(out.view(), &back)
+    assert((str)back.view() == "Fish & Chips 🐟")
+
+test "sequence sets, written and read":
+    var out: Bytes
+    defer out.close()
+    try write_set([1u32, 2, 3, 4, 7, 9, 10], &out)
+    assert((str)out.view() == "1:4,7,9:10")
+    var numbers: Words
+    defer numbers.close()
+    try add_set(b"4:6,9,12:11", &numbers)
+    assert(numbers.used == 6 and numbers.view()[3] == 9 and numbers.view()[5] == 12)
+
+test "internal dates":
+    assert(read_internal_date(b"17-Jul-1996 02:44:25 -0700") == 837596665)
+    assert(read_internal_date(b" 2-Oct-2026 20:34:26 +0000") == 1790973266)
+    assert(read_internal_date(b"garbage") == 0)
+
+test "command arguments: atoms, quoted strings and literals":
+    var command: Command
+    defer command.close()
+    try command.astring(b"INBOX")
+    try command.raw(" ")
+    try command.astring(b"Sent Items")
+    try command.raw(" ")
+    try command.astring(b"pa\"ss")
+    try command.raw(" ")
+    try command.mailbox("Entwürfe".bytes)
+    assert((str)command.text.view() == "INBOX \"Sent Items\" \"pa\\\"ss\" Entw&APw-rfe")
+    command.clear()
+    try command.string(b"line\r\nbreak")
+    assert((str)command.text.view() == "{11}\r\nline\r\nbreak" and command.cuts.used == 1)
+    command.clear()
+    command.literal_plus = true
+    try command.literal(b"abc")
+    assert((str)command.text.view() == "{3+}\r\nabc" and command.cuts.used == 0)

@@ -1,0 +1,187 @@
+#==============================================================================================
+#
+#   imap/tests_session - Sessions against a scripted server on the loopback interface
+#
+#   DESCRIPTION:
+#       The server runs on a thread: it sends a greeting, then for each step reads one
+#       line from the client, checks that what follows the tag starts with the step's
+#       expected text, and sends the step's reply with `TAG` replaced by the client's
+#       tag. A line without a tag (a literal's bytes, DONE) keeps the previous tag.
+#
+#==============================================================================================
+
+## One exchange: what the client sends after its tag, and what the server answers.
+struct Step:
+    var expect: str
+    var reply: str
+
+## A scripted server and how it went.
+struct Script:
+    var listener: net.Listener
+    var greeting: str
+    var steps: const Step[]
+    var completed: usize
+    var failure: str
+
+## Write `text` to `connection`, with `TAG` replaced by `tag`.
+func send_reply(connection: net.Connection*, text: str, tag: const u8[]) -> !:
+    var out: Bytes
+    defer out.close()
+    let data = text.bytes
+    var index: usize = 0
+    while index < data.length:
+        if index + 3 <= data.length and data[index] == 'T' and data[index + 1] == 'A' and data[index + 2] == 'G':
+            try out.put(tag)
+            index += 3
+            continue
+        try out.byte(data[index])
+        index += 1
+    try io.write_all(connection, out.view())
+
+## The scripted server's thread.
+func serve(context: void*?):
+    let script = (Script*)(context else return)
+    var connection = script.listener.accept() catch failure:
+        script.failure = "the server could not accept"
+        return
+    defer connection.destroy()
+    send_reply(&connection, script.greeting, b"*") catch failure:
+        script.failure = "the server could not greet"
+        return
+    var buffer: u8[65536]
+    var used: usize = 0
+    var tag: u8[16]
+    var tag_length: usize = 0
+    for step in script.steps:
+        # One line from the client.
+        var end: usize? = none
+        while end == none:
+            for index in 0..<used:
+                if buffer[index] == '\n':
+                    end = index
+                    break
+            if end != none:
+                break
+            let count = connection.read(buffer[used..]) catch failure:
+                script.failure = "the server could not read"
+                return
+            if count == 0:
+                script.failure = "the client closed early"
+                return
+            used += count
+        let stop = end else return
+        var line = buffer[0..<stop]
+        if line.length > 0 and line[line.length - 1] == '\r':
+            line = line[0..<line.length - 1]
+        var rest = line
+        let space = index_of_byte(line, ' ')
+        if let at = space:
+            if at <= 16 and line[0] == 'a':
+                tag_length = at
+                memory.copy(tag[0..<at], line[0..<at], at)
+                rest = line[at + 1..]
+        if rest.length < step.expect.length or not equal(rest[0..<step.expect.length], step.expect.bytes):
+            script.failure = step.expect
+            return
+        let consumed = stop + 1
+        memory.move(buffer[0..], buffer[consumed..], used - consumed)
+        used -= consumed
+        send_reply(&connection, step.reply, tag[0..<tag_length]) catch failure:
+            script.failure = "the server could not reply"
+            return
+        script.completed += 1
+
+func index_of_byte(data: const u8[], byte: u8) -> usize?:
+    for index in 0..<data.length:
+        if data[index] == byte:
+            return index
+    return none
+
+## Start `script` on a thread and connect a session to it.
+func start_script(script: Script*) -> (Session, thread.Handle)!:
+    script.listener = try net.Listener.bind(net.SocketAddress.loopback(0))
+    let port = (try script.listener.address()).port
+    let handle = try thread.spawn(serve, script)
+    let connection = try net.Connection.connect(net.SocketAddress.loopback(port), nonblocking = true)
+    let session = try Session.over(Link.over(connection, timeout = 5000000000))
+    return (session, handle)
+
+## Wait for the server and check it ran every step.
+func finish_script(script: Script*, handle: thread.Handle) -> !:
+    try handle.join()
+    script.listener.destroy()
+    if script.completed != script.steps.length:
+        print(f"script stopped at step {script.completed}: {script.failure}")
+    assert(script.completed == script.steps.length)
+
+let mailbox_steps: Step[13] = [
+    Step(expect = "AUTHENTICATE PLAIN AGFsaWNlAHNlY3JldA==", reply = "TAG OK [CAPABILITY IMAP4rev1 IDLE MOVE UIDPLUS SPECIAL-USE LIST-EXTENDED ESEARCH] Logged in\r\n"),
+    Step(expect = "LIST \"\" \"*\" RETURN (SPECIAL-USE)", reply = "* LIST (\\HasNoChildren) \"/\" INBOX\r\n* LIST (\\HasNoChildren \\Sent) \"/\" \"Sent Items\"\r\n* LIST (\\HasChildren \\Noselect) \"/\" Entw&APw-rfe\r\nTAG OK LIST done\r\n"),
+    Step(expect = "SELECT INBOX", reply = "* 3 EXISTS\r\n* 0 RECENT\r\n* OK [UIDVALIDITY 1700] UIDs valid\r\n* OK [UIDNEXT 12] Predicted next UID\r\n* FLAGS (\\Seen \\Deleted)\r\nTAG OK [READ-WRITE] Selected\r\n"),
+    Step(expect = "UID FETCH 1:* (UID FLAGS RFC822.SIZE INTERNALDATE BODY.PEEK[HEADER.FIELDS (SUBJECT)])", reply = "* 1 FETCH (UID 4 FLAGS (\\Seen) RFC822.SIZE 100 INTERNALDATE \" 2-Oct-2026 20:34:26 +0000\" BODY[HEADER.FIELDS (SUBJECT)] {15}\r\nSubject: Hi\r\n\r\n)\r\n* 2 FETCH (UID 7 FLAGS () RFC822.SIZE 200 BODY[HEADER.FIELDS (SUBJECT)] \"Subject: Yo\")\r\nTAG OK Fetch done\r\n"),
+    Step(expect = "UID SEARCH RETURN (ALL) UNSEEN", reply = "* ESEARCH (TAG \"TAG\") UID ALL 7,9:11\r\nTAG OK Search done\r\n"),
+    Step(expect = "UID STORE 7 +FLAGS.SILENT (\\Seen \\Flagged)", reply = "TAG OK Store done\r\n"),
+    Step(expect = "UID MOVE 9:11 \"Sent Items\"", reply = "* 2 EXPUNGE\r\n* 2 EXPUNGE\r\n* 2 EXPUNGE\r\nTAG OK Move done\r\n"),
+    Step(expect = "UID FETCH 4 (UID BODY.PEEK[])", reply = "* 1 FETCH (UID 4 BODY[] {19}\r\nSubject: Hi\r\n\r\nYo\r\n)\r\nTAG OK done\r\n"),
+    Step(expect = "APPEND Entw&APw-rfe (\\Seen \\Draft) {5}", reply = "+ Ready for literal data\r\n"),
+    Step(expect = "hello", reply = "TAG OK [APPENDUID 1700 42] Append done\r\n"),
+    Step(expect = "NOOP", reply = "* 5 FETCH (FLAGS (\\Seen $Junk))\r\n* 6 EXISTS\r\nTAG OK NOOP done\r\n"),
+    Step(expect = "IDLE", reply = "+ idling\r\n* 7 EXISTS\r\n"),
+    Step(expect = "DONE", reply = "TAG OK Idle done\r\n"),
+]
+
+test "a session lists, selects, fetches, searches, changes, appends and idles":
+    var script = Script(greeting = "* OK [CAPABILITY IMAP4rev1 AUTH=PLAIN SASL-IR] Ready\r\n", steps = mailbox_steps)
+    var (session, handle) = try start_script(&script)
+    defer session.close()
+    try session.login("alice", "secret")
+    assert(session.is_authenticated() and session.has("IDLE") and session.has("move"))
+    let boxes = try session.list()
+    assert(boxes.length == 3)
+    assert(boxes[1].name == "Sent Items" and boxes[1].is(MailboxFlags.sent) and boxes[1].delimiter == '/')
+    assert(boxes[2].name == "Entwürfe" and equal(boxes[2].path, b"Entw&APw-rfe") and boxes[2].is(MailboxFlags.no_select))
+    let state = try session.select("INBOX")
+    assert(state.exists == 3 and state.uid_validity == 1700 and state.uid_next == 12 and not state.read_only)
+    assert(not session.has_events())
+    let records = try session.fetch("1:*", "(UID FLAGS RFC822.SIZE INTERNALDATE BODY.PEEK[HEADER.FIELDS (SUBJECT)])")
+    assert(records.length == 2)
+    assert(records[0].uid == 4 and records[0].is(Flags.seen) and records[0].size == 100 and records[0].internal_date == 1790973266)
+    assert(equal(records[0].header, b"Subject: Hi\r\n\r\n") and equal(records[1].header, b"Subject: Yo"))
+    assert(records[1].has_flags and records[1].flags == Flags.empty)
+    let unseen = try session.search("UNSEEN")
+    assert(unseen.length == 4 and unseen[0] == 7 and unseen[3] == 11)
+    try session.store("7", Flags.seen | Flags.flagged, true)
+    try session.move("9:11", "Sent Items")
+    assert(session.expunges().length == 3 and session.selected.exists == 0)
+    session.take_events()
+    assert(equal(try session.fetch_message(4), b"Subject: Hi\r\n\r\nYo\r\n"))
+    assert(try session.append("Entwürfe", b"hello", Flags.seen | Flags.draft) == 42)
+    try session.noop()
+    assert(session.has_events() and session.selected.exists == 6)
+    assert(session.flag_changes().length == 1 and session.flag_changes()[0].is(Flags.junk))
+    session.take_events()
+    assert(try session.idle(2000000000))
+    assert(session.selected.exists == 7)
+    try finish_script(&script, handle)
+
+let refusing_steps: Step[3] = [
+    Step(expect = "CAPABILITY", reply = "* CAPABILITY IMAP4rev1 LITERAL+\r\nTAG OK Capability done\r\n"),
+    Step(expect = "LOGIN alice \"wrong pass\"", reply = "TAG NO [AUTHENTICATIONFAILED] Invalid credentials\r\n"),
+    Step(expect = "LOGOUT", reply = "* BYE Logging out\r\nTAG OK Logout completed\r\n"),
+]
+
+test "a refused login fails with the server's text and the session logs out":
+    var script = Script(greeting = "* OK Ready\r\n", steps = refusing_steps)
+    var (session, handle) = start_script(&script) catch failure:
+        trap(failure.message)
+    defer session.close()
+    var refused = false
+    session.login("alice", "wrong pass") catch failure:
+        assert(failure.code == authentication)
+        assert(session.text() == "Invalid credentials")
+        refused = true
+        recover ()
+    assert(refused)
+    assert(not session.is_authenticated())
+    session.logout()
+    try finish_script(&script, handle)

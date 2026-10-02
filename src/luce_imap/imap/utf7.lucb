@@ -1,0 +1,135 @@
+#==============================================================================================
+#
+#   imap/utf7 - Mailbox names in modified UTF-7
+#
+#   DESCRIPTION:
+#       IMAP4rev1 servers name mailboxes in a variant of UTF-7 (RFC 3501 §5.1.3): printable
+#       ASCII stands for itself except `&`, written `&-`; anything else is UTF-16 in a
+#       modified base64 (`,` for `/`, no padding) between `&` and `-`. "Entwürfe" is
+#       `Entw&APw-rfe`. Decoding is lenient: a broken run is kept as written.
+#
+#==============================================================================================
+
+let utf7_alphabet: str = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+,"
+
+## The six-bit value of modified-base64 character `byte`, or none.
+func utf7_value(byte: u8) -> u32?:
+    if byte >= 'A' and byte <= 'Z':
+        return byte - 'A'
+    if byte >= 'a' and byte <= 'z':
+        return byte - 'a' + 26
+    if byte >= '0' and byte <= '9':
+        return byte - '0' + 52
+    if byte == '+':
+        return 62
+    if byte == ',':
+        return 63
+    return none
+
+## Append the UTF-8 encoding of `scalar`.
+func put_scalar(scalar: u32, out: Bytes*) -> !:
+    var buffer: u8[4]
+    let count = utf8.encode(scalar, buffer) else 0
+    if count == 0:
+        try out.put(b"\xEF\xBF\xBD")
+    else:
+        try out.put(buffer[0..<count])
+
+## Decode the base64 run `run` (between `&` and `-`) as UTF-16 onto `out`; false when
+## it is not valid.
+func decode_run(run: const u8[], out: Bytes*) -> bool!:
+    var units: Words
+    defer units.close()
+    var bits: u32 = 0
+    var held: u32 = 0
+    for byte in run:
+        let value = utf7_value(byte) else return false
+        bits = (bits << 6) | value
+        held += 6
+        if held >= 16:
+            held -= 16
+            try units.add((bits >> held) & 0xFFFF)
+    var index: usize = 0
+    let list = units.view()
+    while index < list.length:
+        let code_unit = list[index]
+        if code_unit >= 0xD800 and code_unit < 0xDC00 and index + 1 < list.length and list[index + 1] >= 0xDC00 and list[index + 1] < 0xE000:
+            try put_scalar(0x10000 + ((code_unit - 0xD800) << 10) + (list[index + 1] - 0xDC00), out)
+            index += 2
+        else:
+            try put_scalar(code_unit, out)
+            index += 1
+    return true
+
+## Append mailbox name `name`, decoded from modified UTF-7, as UTF-8.
+pub func decode_mailbox(name: const u8[], out: Bytes*) -> !:
+    var index: usize = 0
+    while index < name.length:
+        let byte = name[index]
+        if byte != '&':
+            try out.byte(byte)
+            index += 1
+            continue
+        var end = index + 1
+        while end < name.length and name[end] != '-':
+            end += 1
+        if end == name.length:
+            try out.put(name[index..])
+            return
+        if end == index + 1:
+            try out.byte('&')
+        elif not try decode_run(name[index + 1..<end], out):
+            try out.put(name[index..<end + 1])
+        index = end + 1
+
+## Append the UTF-16 units of `scalar` to `units`.
+func add_units(scalar: u32, units: Words*) -> !:
+    if scalar >= 0x10000:
+        let rest = scalar - 0x10000
+        try units.add(0xD800 + (rest >> 10))
+        try units.add(0xDC00 + (rest & 0x3FF))
+    else:
+        try units.add(scalar)
+
+## Append the run of UTF-16 `units` in modified base64 between `&` and `-`.
+func encode_run(units: const u32[], out: Bytes*) -> !:
+    let letters = utf7_alphabet.bytes
+    try out.byte('&')
+    var bits: u32 = 0
+    var held: u32 = 0
+    for code_unit in units:
+        bits = (bits << 16) | code_unit
+        held += 16
+        while held >= 6:
+            held -= 6
+            try out.byte(letters[(bits >> held) & 63])
+        bits &= (1u32 << held) - 1
+    if held > 0:
+        try out.byte(letters[(bits << (6 - held)) & 63])
+    try out.byte('-')
+
+## Append UTF-8 mailbox name `name` in modified UTF-7.
+pub func encode_mailbox(name: const u8[], out: Bytes*) -> !:
+    var units: Words
+    defer units.close()
+    var index: usize = 0
+    while index < name.length:
+        let byte = name[index]
+        if byte >= 0x20 and byte <= 0x7E:
+            if units.used > 0:
+                try encode_run(units.view(), out)
+                units.clear()
+            if byte == '&':
+                try out.put(b"&-")
+            else:
+                try out.byte(byte)
+            index += 1
+            continue
+        if let decoded = utf8.decode(name, index):
+            try add_units((u32)decoded.scalar, &units)
+            index += decoded.width
+        else:
+            try add_units(0xFFFD, &units)
+            index += 1
+    if units.used > 0:
+        try encode_run(units.view(), out)

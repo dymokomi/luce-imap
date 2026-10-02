@@ -1,0 +1,373 @@
+#==============================================================================================
+#
+#   imap/messages - Selecting a mailbox and working on its messages
+#
+#   DESCRIPTION:
+#       `select` opens a mailbox and records its state. The message commands then work
+#       by UID: `fetch` returns one Fetched record a message (UID, flags, size, internal
+#       date, mod-sequence, and the header or body sections asked for), `search` the UIDs
+#       a criterion matches, `store` changes flags, `copy` and `move` file messages
+#       elsewhere (MOVE when the server has it, COPY + \Deleted + expunge otherwise),
+#       `expunge` removes what is marked deleted, `append` adds a message to a mailbox.
+#
+#==============================================================================================
+
+## A message's system flags and common keywords, as bits.
+pub enum Flags as u16:
+    empty = 0
+    seen = 1
+    answered = 2
+    flagged = 4
+    deleted = 8
+    draft = 16
+    recent = 32
+    forwarded = 64
+    junk = 128
+    not_junk = 256
+
+## The flag names a server sends and a client sets, with their bits.
+let flag_names: (str, u16)[9] = [
+    ("\\Seen", 1), ("\\Answered", 2), ("\\Flagged", 4), ("\\Deleted", 8), ("\\Draft", 16),
+    ("\\Recent", 32), ("$Forwarded", 64), ("$Junk", 128), ("$NotJunk", 256),
+]
+
+## One message a FETCH returned. Section bytes last until the next command.
+pub struct Fetched:
+    pub var sequence: u32
+    pub var uid: u32
+    pub var flags: Flags
+    ## Whether the response named the flags at all.
+    pub var has_flags: bool
+    pub var size: u64
+    ## INTERNALDATE in seconds since 1970 UTC; zero when not fetched.
+    pub var internal_date: i64
+    pub var modseq: u64
+    ## The bytes of a header section (BODY[HEADER…], RFC822.HEADER), when fetched.
+    pub var header: const u8[]
+    ## The bytes of any other section (BODY[], BODY[TEXT], RFC822), when fetched.
+    pub var body: const u8[]
+
+    ## Whether the message has flag `flag`.
+    pub func is(flag: Flags) -> bool:
+        return (self.flags & flag) != Flags.empty
+
+## Append `flags` as a parenthesised flag list: `(\Seen \Flagged)`.
+pub func write_flags(flags: Flags, out: Bytes*) -> !:
+    try out.byte('(')
+    var first = true
+    for entry in flag_names:
+        if entry.1 == 32:
+            continue
+        if ((u16)flags & entry.1) != 0:
+            if not first:
+                try out.byte(' ')
+            first = false
+            try out.text(entry.0)
+    try out.byte(')')
+
+let month_abbreviations: str[12] = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"]
+
+## Days from 1970-01-01 to a civil date (proleptic Gregorian).
+func days_from_civil(year: i64, month: i64, day: i64) -> i64:
+    let y = year - 1 if month <= 2 else year
+    let era = (y if y >= 0 else y - 399) // 400
+    let year_of_era = y - era * 400
+    let day_of_year = (153 * (month - 3 if month > 2 else month + 9) + 2) // 5 + day - 1
+    let day_of_era = year_of_era * 365 + year_of_era // 4 - year_of_era // 100 + day_of_year
+    return era * 146097 + day_of_era - 719468
+
+## The two-or-more digit number at `data[start..<end]`, or none.
+func digits_at(data: const u8[], start: usize, end: usize) -> i64?:
+    if end > data.length or start >= end:
+        return none
+    var value: i64 = 0
+    for byte in data[start..<end]:
+        if byte == ' ':
+            continue
+        if byte < '0' or byte > '9':
+            return none
+        value = value * 10 + (i64)(byte - '0')
+    return value
+
+## An INTERNALDATE, `17-Jul-1996 02:44:25 -0700`, in seconds since 1970 UTC; zero when
+## it cannot be read.
+pub func read_internal_date(text: const u8[]) -> i64:
+    if text.length < 26:
+        return 0
+    let day = digits_at(text, 0, 2) else return 0
+    var month: i64 = 0
+    for index: usize in 0..<12:
+        if same(text[3..<6], month_abbreviations[index].bytes):
+            month = (i64)index + 1
+    let year = digits_at(text, 7, 11) else return 0
+    let hour = digits_at(text, 12, 14) else return 0
+    let minute = digits_at(text, 15, 17) else return 0
+    let second = digits_at(text, 18, 20) else return 0
+    let zone = digits_at(text, 22, 26) else return 0
+    if month == 0:
+        return 0
+    var offset = (zone // 100) * 60 + zone % 100
+    if text[21] == '-':
+        offset = -offset
+    return days_from_civil(year, month, day) * 86400 + hour * 3600 + minute * 60 + second - offset * 60
+
+extend Session:
+    # mark: selecting ============================================================================
+
+    ## Select mailbox `name` (UTF-8) to work on its messages; read-only with `read_only`
+    ## (EXAMINE). The state is in `selected`.
+    pub mutating func select(name: str, read_only: bool = false) -> Selected!:
+        self.has_selected = false
+        self.selected = Selected()
+        self.take_events()
+        self.command.clear()
+        try self.command.raw("EXAMINE " if read_only else "SELECT ")
+        try self.command.mailbox(name.bytes)
+        if self.has("CONDSTORE"):
+            try self.command.raw(" (CONDSTORE)")
+        try self.run(Collect.nothing)
+        if read_only:
+            self.selected.read_only = true
+        self.has_selected = true
+        # The counts just read are the starting state, not news.
+        self.take_events()
+        return self.selected
+
+    ## Leave the selected mailbox without expunging (UNSELECT, or CLOSE when the server
+    ## lacks it, which does expunge).
+    pub mutating func unselect() -> !:
+        if not self.has_selected:
+            return
+        try self.simple("UNSELECT" if self.has("UNSELECT") else "CLOSE")
+        self.has_selected = false
+
+    func require_selected() -> !:
+        if not self.has_selected:
+            error(not_selected, "no mailbox is selected")
+
+    # mark: fetching =============================================================================
+
+    ## Fetch `items` (`(UID FLAGS BODY.PEEK[])`) of the messages in UID set `set`
+    ## (`1:*`, `5,7:9`); `changed_since` > 0 asks only for messages whose mod-sequence is
+    ## newer (CONDSTORE). Records last until the next command.
+    pub mutating func fetch(set: str, items: str, changed_since: u64 = 0) -> const Fetched[]!:
+        try self.require_selected()
+        self.reset_results()
+        self.command.clear()
+        try self.command.raw("UID FETCH ")
+        try self.command.raw(set)
+        try self.command.raw(" ")
+        try self.command.raw(items)
+        if changed_since > 0 and self.has("CONDSTORE"):
+            try self.command.raw(" (CHANGEDSINCE ")
+            try self.command.number(changed_since)
+            try self.command.raw(")")
+        try self.run(Collect.messages)
+        return self.message_list.view()
+
+    ## The records the last `fetch` returned.
+    pub func fetched() -> const Fetched[]:
+        return self.message_list.view()
+
+    ## Read the current FETCH response into a record.
+    mutating func read_fetch() -> Fetched!:
+        let response = &self.response
+        var fetched = Fetched(sequence = response.number else 0, flags = Flags.empty)
+        let items = response.at(response.values, 0) else return fetched
+        var current = response.first(items)
+        while let item = current:
+            let value = response.next(item) else break
+            let name = response.bytes(item)
+            if same(name, b"UID"):
+                fetched.uid = u32(response.number_of(value) else 0)
+            elif same(name, b"FLAGS"):
+                fetched.has_flags = true
+                var flag = response.first(value)
+                while let node = flag:
+                    for entry in flag_names:
+                        if same(response.bytes(node), entry.0.bytes):
+                            fetched.flags = fetched.flags | (Flags)entry.1
+                    flag = response.next(node)
+            elif same(name, b"RFC822.SIZE"):
+                fetched.size = response.number_of(value) else 0
+            elif same(name, b"INTERNALDATE"):
+                var text: Bytes
+                defer text.close()
+                try response.string(value, &text)
+                fetched.internal_date = read_internal_date(text.view())
+            elif same(name, b"MODSEQ"):
+                if let number = response.first(value):
+                    fetched.modseq = response.number_of(number) else 0
+            elif starts(name, b"BODY[") or starts(name, b"RFC822") or starts(name, b"BINARY["):
+                var data: Bytes
+                defer data.close()
+                try response.string(value, &data)
+                let kept = try self.pool.keep(data.view())
+                if contains_word(name, b"HEADER") or same(name, b"RFC822.HEADER"):
+                    fetched.header = kept
+                else:
+                    fetched.body = kept
+            current = response.next(value)
+        return fetched
+
+    ## The headers named in `fields` (`DATE FROM SUBJECT`), plus UID, flags, size and
+    ## internal date, of the messages in UID set `set`: what a message list needs.
+    pub mutating func fetch_headers(set: str, fields: str) -> const Fetched[]!:
+        var items: Bytes
+        defer items.close()
+        try items.put(b"(UID FLAGS RFC822.SIZE INTERNALDATE")
+        if self.has("CONDSTORE"):
+            try items.put(b" MODSEQ")
+        try items.put(b" BODY.PEEK[HEADER.FIELDS (")
+        try items.text(fields)
+        try items.put(b")])")
+        return try self.fetch(set, (str)items.view())
+
+    ## The whole message with UID `uid`, without marking it seen; empty when it is gone.
+    pub mutating func fetch_message(uid: u32) -> const u8[]!:
+        var set: Bytes
+        defer set.close()
+        try set.number(uid)
+        let records = try self.fetch((str)set.view(), "(UID BODY.PEEK[])")
+        for record in records:
+            if record.uid == uid:
+                return record.body
+        var none_found: const u8[]
+        return none_found
+
+    # mark: searching ============================================================================
+
+    ## The UIDs of the messages matching `criteria` (`ALL`, `UNSEEN`, `SINCE 1-Oct-2026`),
+    ## in ascending order. They last until the next command.
+    pub mutating func search(criteria: str) -> const u32[]!:
+        try self.require_selected()
+        self.reset_results()
+        self.command.clear()
+        try self.command.raw("UID SEARCH ")
+        if self.has("ESEARCH"):
+            try self.command.raw("RETURN (ALL) ")
+        try self.command.raw(criteria)
+        try self.run(Collect.search)
+        sort(self.found.data[0..<self.found.used])
+        return self.found.view()
+
+    ## Take in an ESEARCH response: `* ESEARCH (TAG "a5") UID ALL 4:19,21`.
+    mutating func read_esearch() -> !:
+        let response = &self.response
+        var current = response.first(response.values)
+        while let item = current:
+            if response.is_atom(item, "ALL"):
+                let value = response.next(item) else return
+                try add_set(response.bytes(value), &self.found)
+                return
+            current = response.next(item)
+
+    # mark: changing messages ====================================================================
+
+    ## Add (`add`) or remove flags `flags` on the messages in UID set `set`, silently.
+    pub mutating func store(set: str, flags: Flags, add: bool) -> !:
+        try self.require_selected()
+        self.command.clear()
+        try self.command.raw("UID STORE ")
+        try self.command.raw(set)
+        try self.command.raw(" +FLAGS.SILENT " if add else " -FLAGS.SILENT ")
+        try write_flags(flags, &self.command.text)
+        try self.run(Collect.nothing)
+
+    ## Copy the messages in UID set `set` to mailbox `name` (UTF-8).
+    pub mutating func copy(set: str, name: str) -> !:
+        try self.require_selected()
+        self.command.clear()
+        try self.command.raw("UID COPY ")
+        try self.command.raw(set)
+        try self.command.raw(" ")
+        try self.command.mailbox(name.bytes)
+        try self.run(Collect.nothing)
+
+    ## Move the messages in UID set `set` to mailbox `name` (UTF-8).
+    pub mutating func move(set: str, name: str) -> !:
+        try self.require_selected()
+        if not self.has("MOVE"):
+            try self.copy(set, name)
+            try self.store(set, Flags.deleted, true)
+            try self.expunge(set)
+            return
+        self.command.clear()
+        try self.command.raw("UID MOVE ")
+        try self.command.raw(set)
+        try self.command.raw(" ")
+        try self.command.mailbox(name.bytes)
+        try self.run(Collect.nothing)
+
+    ## Remove the messages marked \Deleted: only those in UID set `set` when the server
+    ## has UIDPLUS, all of them otherwise (or when `set` is empty).
+    pub mutating func expunge(set: str = "") -> !:
+        try self.require_selected()
+        self.command.clear()
+        if set.length > 0 and self.has("UIDPLUS"):
+            try self.command.raw("UID EXPUNGE ")
+            try self.command.raw(set)
+        else:
+            try self.command.raw("EXPUNGE")
+        try self.run(Collect.nothing)
+
+    ## Add message `data` to mailbox `name` (UTF-8) with `flags`; its UID when the server
+    ## says (UIDPLUS), zero otherwise.
+    pub mutating func append(name: str, data: const u8[], flags: Flags = Flags.empty) -> u32!:
+        self.reset_results()
+        self.command.clear()
+        try self.command.raw("APPEND ")
+        try self.command.mailbox(name.bytes)
+        try self.command.raw(" ")
+        try write_flags(flags, &self.command.text)
+        try self.command.raw(" ")
+        try self.command.literal(data)
+        try self.run(Collect.nothing)
+        return self.appended
+
+## Whether `name` holds `word` ignoring case: `BODY[HEADER.FIELDS (…)]` holds HEADER.
+func contains_word(name: const u8[], word: const u8[]) -> bool:
+    var index: usize = 0
+    while index + word.length <= name.length:
+        if same(name[index..<index + word.length], word):
+            return true
+        index += 1
+    return false
+
+## Append the numbers of sequence set `text` (`4:7,9`) to `out`.
+func add_set(text: const u8[], out: Words*) -> !:
+    var index: usize = 0
+    while index < text.length:
+        var first: u32 = 0
+        while index < text.length and text[index] >= '0' and text[index] <= '9':
+            first = first * 10 + (u32)(text[index] - '0')
+            index += 1
+        var last = first
+        if index < text.length and text[index] == ':':
+            index += 1
+            last = 0
+            while index < text.length and text[index] >= '0' and text[index] <= '9':
+                last = last * 10 + (u32)(text[index] - '0')
+                index += 1
+        let low = first if first < last else last
+        let high = last if first < last else first
+        if high - low > 10000000:
+            error(limit_exceeded, "a search result range is too large")
+        var value = low
+        while value <= high:
+            try out.add(value)
+            value += 1
+        index += 1
+
+## Sort `values` ascending: a shell sort, as results are mostly in order already.
+func sort(values: u32[]):
+    var gap = values.length // 2
+    while gap > 0:
+        for index in gap..<values.length:
+            let value = values[index]
+            var at = index
+            while at >= gap and values[at - gap] > value:
+                values[at] = values[at - gap]
+                at -= gap
+            values[at] = value
+        gap = gap // 2

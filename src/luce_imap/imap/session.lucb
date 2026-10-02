@@ -1,0 +1,456 @@
+#==============================================================================================
+#
+#   imap/session - Commands run, responses dispatched, state kept
+#
+#   DESCRIPTION:
+#       `Session.open` connects, reads the greeting, upgrades with STARTTLS when asked
+#       and learns the capabilities. Every command goes through `run`: the session tags
+#       it, sends it (pausing at synchronizing literals for the server's `+`), and reads
+#       responses until its tagged completion. Untagged responses on the way are absorbed
+#       (`absorb`): state (EXISTS, capabilities, response codes) is updated at once, and
+#       data the command asked for (LIST, FETCH, SEARCH, STATUS) goes into the result
+#       lists; other FETCH and EXPUNGE responses become events. NO, BAD and BYE fail the
+#       command with the server's text.
+#
+#==============================================================================================
+
+## What the running command collects from untagged responses.
+enum Collect as u8:
+    nothing = 0
+    mailboxes = 1
+    messages = 2
+    search = 3
+    status = 4
+
+## The state of the selected mailbox.
+pub struct Selected:
+    pub var exists: u32
+    pub var recent: u32
+    pub var uid_validity: u32
+    pub var uid_next: u32
+    ## Zero when the server has no CONDSTORE.
+    pub var highest_modseq: u64
+    ## The sequence number of the first unseen message, zero when not given.
+    pub var first_unseen: u32
+    pub var read_only: bool
+
+## A connection to one IMAP server.
+pub struct Session:
+    var link: Link
+    var reader: Reader
+    var response: Response
+    var command: Command
+    var tag_number: u32
+    ## Capability names upper-cased, each between spaces: ` IMAP4REV1 IDLE `.
+    var capabilities: Bytes
+    var authenticated: bool
+    var has_selected: bool
+    pub var selected: Selected
+    ## The server's text from the last NO, BAD, BYE or ALERT, printable ASCII only.
+    var last_text: Bytes
+    var collect: Collect
+    ## A SASL answer to send at the next continuation request, then empty lines.
+    var sasl: Bytes
+    var sasl_sent: bool
+    # The results of the last command.
+    var pool: TextPool
+    var mailbox_list: Records[Mailbox]
+    var message_list: Records[Fetched]
+    var found: Words
+    var status_result: MailboxStatus
+    var appended: u32
+    # Events since the last `take_events`.
+    var expunged: Words
+    var changes: Records[Fetched]
+    var exists_changed: bool
+
+    ## Connect to `host`, read the greeting, upgrade with STARTTLS when `security` asks
+    ## for it, and learn the capabilities.
+    pub static func open(host: str, port: u16, security: Security, timeout: u64 = default_timeout, cancellation: sync.Cancellation*? = none, trust: tls_stream.Trust = tls_stream.Trust()) -> Session!:
+        let link = try Link.connect(host, port, security == Security.tls, timeout, cancellation, trust)
+        var session = Session(link = link, selected = Selected(), collect = Collect.nothing)
+        errdefer session.close()
+        try session.greet()
+        if security == Security.starttls:
+            if not session.has("STARTTLS"):
+                error(unsupported, "the server does not offer STARTTLS")
+            try session.simple("STARTTLS")
+            if session.reader.pending():
+                error(protocol, "the server sent data after its STARTTLS answer")
+            try session.link.start_tls(host, trust)
+            session.capabilities.clear()
+            try session.simple("CAPABILITY")
+        return session
+
+    ## A session over an already connected, plain `link` (tests, proxies).
+    pub static func over(link: Link) -> Session!:
+        var session = Session(link = link, selected = Selected(), collect = Collect.nothing)
+        errdefer session.close()
+        try session.greet()
+        return session
+
+    ## Read the greeting; learn the capabilities if it did not name them.
+    mutating func greet() -> !:
+        let raw = try self.reader.read(&self.link)
+        try self.response.parse(raw)
+        if not self.response.is_untagged():
+            error(protocol, "the server did not greet")
+        try self.absorb()
+        match self.response.status:
+            .ok: self.authenticated = false
+            .preauth: self.authenticated = true
+            .bye: error(disconnected, self.text())
+            _: error(protocol, "the server's greeting is not OK")
+        if self.capabilities.used == 0:
+            try self.simple("CAPABILITY")
+
+    ## Whether the server offers capability `name` (`IDLE`, `AUTH=PLAIN`), ignoring case.
+    pub func has(name: str) -> bool:
+        let data = self.capabilities.view()
+        var index: usize = 0
+        while index + name.length + 2 <= data.length:
+            if data[index] == ' ' and data[index + name.length + 1] == ' ' and same(data[index + 1..<index + 1 + name.length], name.bytes):
+                return true
+            index += 1
+        return false
+
+    ## Whether the session is logged in.
+    pub func is_authenticated() -> bool:
+        return self.authenticated
+
+    ## Whether a mailbox is selected.
+    pub func is_selected() -> bool:
+        return self.has_selected
+
+    ## Whether the connection is protected by TLS.
+    pub func is_secure() -> bool:
+        return self.link.is_secure()
+
+    ## The server's text from the last failure, for showing the user.
+    pub func text() -> str:
+        return (str)self.last_text.view()
+
+    # mark: running commands =====================================================================
+
+    ## Run a command with no arguments that collects nothing.
+    mutating func simple(name: str) -> !:
+        self.command.clear()
+        try self.command.raw(name)
+        try self.run(Collect.nothing)
+
+    ## Run the command in `self.command`, collecting `collect`, until its completion.
+    mutating func run(collect: Collect) -> !:
+        self.collect = collect
+        self.command.literal_plus = self.has("LITERAL+")
+        self.tag_number += 1
+        var tag: Bytes
+        defer tag.close()
+        try tag.byte('a')
+        try tag.number(self.tag_number)
+        var line: Bytes
+        defer line.close()
+        try line.put(tag.view())
+        try line.byte(' ')
+        let text = self.command.text.view()
+        var sent: usize = 0
+        for cut in self.command.cuts.view():
+            try line.put(text[sent..<(usize)cut])
+            try self.link.write(line.view())
+            line.clear()
+            sent = cut
+            # The server says `+` before a synchronizing literal's bytes, or refuses.
+            if not try self.await_continuation(tag.view()):
+                return
+        try line.put(text[sent..])
+        try line.put(b"\r\n")
+        try self.link.write(line.view())
+        self.sasl_sent = false
+        while true:
+            let raw = try self.reader.read(&self.link)
+            try self.response.parse(raw)
+            if self.response.is_continuation():
+                # Only SASL asks to go on after the whole command was sent.
+                if self.sasl.used > 0 and not self.sasl_sent:
+                    try self.sasl.put(b"\r\n")
+                    try self.link.write(self.sasl.view())
+                    self.sasl_sent = true
+                else:
+                    try self.link.write(b"\r\n")
+                continue
+            if self.response.is_untagged():
+                try self.absorb()
+                continue
+            if not equal(self.response.tag, tag.view()):
+                continue
+            try self.complete()
+            return
+
+    ## Wait for the continuation request before a literal's bytes: true to send them,
+    ## false when the command completed instead (it failed, which `complete` reports).
+    mutating func await_continuation(tag: const u8[]) -> bool!:
+        while true:
+            let raw = try self.reader.read(&self.link)
+            try self.response.parse(raw)
+            if self.response.is_continuation():
+                return true
+            if self.response.is_untagged():
+                try self.absorb()
+                continue
+            if equal(self.response.tag, tag):
+                try self.complete()
+                error(protocol, "the server completed a command before its literal")
+
+    ## Finish the command whose tagged completion is the current response.
+    mutating func complete() -> !:
+        try self.code()
+        self.collect = Collect.nothing
+        match self.response.status:
+            .ok: return
+            .no:
+                try self.keep_text()
+                error(rejected, self.text())
+            .bad:
+                try self.keep_text()
+                error(bad_command, self.text())
+            _: error(protocol, "a command completed without a status")
+
+    ## Keep the current response's text in `last_text`, printable ASCII only.
+    mutating func keep_text() -> !:
+        self.last_text.clear()
+        for byte in self.response.text:
+            try self.last_text.byte(byte if byte >= 0x20 and byte < 0x7F else '?')
+        if self.last_text.used == 0:
+            try self.last_text.text("the server gave no reason")
+
+    # mark: untagged responses ===================================================================
+
+    ## Take in the current untagged response.
+    mutating func absorb() -> !:
+        let response = &self.response
+        if response.status != Status.data:
+            try self.code()
+            if response.status == Status.bye:
+                try self.keep_text()
+            elif response.status != Status.ok and response.status != Status.preauth:
+                try self.keep_text()
+            return
+        if response.is("CAPABILITY"):
+            try self.learn_capabilities(response.values)
+        elif response.is("EXISTS"):
+            self.selected.exists = response.number else 0
+            self.exists_changed = true
+        elif response.is("RECENT"):
+            self.selected.recent = response.number else 0
+        elif response.is("EXPUNGE"):
+            if let number = response.number:
+                try self.expunged.add(number)
+                if self.selected.exists > 0:
+                    self.selected.exists -= 1
+                self.exists_changed = true
+        elif response.is("FETCH"):
+            let fetched = try self.read_fetch()
+            if self.collect == Collect.messages:
+                try self.message_list.add(fetched)
+            else:
+                try self.changes.add(fetched)
+        elif response.is("LIST") or response.is("LSUB"):
+            if self.collect == Collect.mailboxes:
+                try self.read_list()
+        elif response.is("STATUS"):
+            if self.collect == Collect.status:
+                self.read_status()
+        elif response.is("SEARCH"):
+            if self.collect == Collect.search:
+                var node = response.first(response.values)
+                while let value = node:
+                    if let number = response.number_of(value):
+                        try self.found.add(u32(number))
+                    node = response.next(value)
+        elif response.is("ESEARCH"):
+            if self.collect == Collect.search:
+                try self.read_esearch()
+        elif response.is("ENABLED"):
+            var node = response.first(response.values)
+            while let value = node:
+                if response.is_atom(value, "UTF8=ACCEPT"):
+                    self.command.utf8 = true
+                node = response.next(value)
+
+    ## Replace the capabilities with the atoms in list `node`.
+    mutating func learn_capabilities(node: usize) -> !:
+        self.capabilities.clear()
+        try self.capabilities.byte(' ')
+        var current = self.response.first(node)
+        while let value = current:
+            for byte in self.response.bytes(value):
+                try self.capabilities.byte(byte - 32 if byte >= 'a' and byte <= 'z' else byte)
+            try self.capabilities.byte(' ')
+            current = self.response.next(value)
+
+    ## Take in the current status response's code: `[UIDVALIDITY 3]`, `[CAPABILITY …]`.
+    mutating func code() -> !:
+        let response = &self.response
+        let code = response.code
+        if code.length == 0:
+            return
+        let first = response.first(response.code_values)
+        var number: u64 = 0
+        if let node = first:
+            number = response.number_of(node) else 0
+        if same(code, b"CAPABILITY"):
+            try self.learn_capabilities(response.code_values)
+        elif same(code, b"UIDVALIDITY"):
+            self.selected.uid_validity = u32(number)
+        elif same(code, b"UIDNEXT"):
+            self.selected.uid_next = u32(number)
+        elif same(code, b"HIGHESTMODSEQ"):
+            self.selected.highest_modseq = number
+        elif same(code, b"UNSEEN"):
+            self.selected.first_unseen = u32(number)
+        elif same(code, b"READ-ONLY"):
+            self.selected.read_only = true
+        elif same(code, b"READ-WRITE"):
+            self.selected.read_only = false
+        elif same(code, b"APPENDUID"):
+            if let second = response.at(response.code_values, 1):
+                self.appended = u32(response.number_of(second) else 0)
+        elif same(code, b"ALERT"):
+            try self.keep_text()
+
+    # mark: events ===============================================================================
+
+    ## Whether anything happened to the selected mailbox since the last `take_events`:
+    ## new messages, expunges or flag changes.
+    pub func has_events() -> bool:
+        return self.exists_changed or self.expunged.used > 0 or self.changes.used > 0
+
+    ## Sequence numbers expunged since the last `take_events`, in the order the server
+    ## sent them (each counted after the ones before it were removed).
+    pub func expunges() -> const u32[]:
+        return self.expunged.view()
+
+    ## Messages whose flags changed since the last `take_events`.
+    pub func flag_changes() -> const Fetched[]:
+        return self.changes.view()
+
+    ## Forget the events.
+    pub mutating func take_events():
+        self.expunged.clear()
+        self.changes.clear()
+        self.exists_changed = false
+
+    # mark: login and logout =====================================================================
+
+    ## Log in with a user name and password: SASL PLAIN when offered, LOGIN otherwise.
+    pub mutating func login(user: str, password: str) -> !:
+        if self.authenticated:
+            return
+        if self.has("AUTH=PLAIN"):
+            var answer: Bytes
+            defer answer.close()
+            try answer.byte(0)
+            try answer.text(user)
+            try answer.byte(0)
+            try answer.text(password)
+            try self.authenticate("PLAIN", answer.view())
+            return
+        if self.has("LOGINDISABLED"):
+            error(unsupported, "the server refuses LOGIN on this connection")
+        self.command.clear()
+        try self.command.raw("LOGIN ")
+        try self.command.astring(user.bytes)
+        try self.command.raw(" ")
+        try self.command.astring(password.bytes)
+        self.run(Collect.nothing) catch failure:
+            if failure.code == rejected:
+                error(authentication, self.text())
+            error(failure.code, failure.message)
+        try self.after_login()
+
+    ## Log in with an OAuth 2 access token (SASL XOAUTH2, as Gmail and Outlook use).
+    pub mutating func login_oauth(user: str, token: str) -> !:
+        if not self.has("AUTH=XOAUTH2"):
+            error(unsupported, "the server does not offer XOAUTH2")
+        var answer: Bytes
+        defer answer.close()
+        try answer.put(b"user=")
+        try answer.text(user)
+        try answer.put(b"\x01auth=Bearer ")
+        try answer.text(token)
+        try answer.put(b"\x01\x01")
+        try self.authenticate("XOAUTH2", answer.view())
+
+    ## Run AUTHENTICATE `mechanism` with the SASL answer `answer`.
+    mutating func authenticate(mechanism: str, answer: const u8[]) -> !:
+        self.command.clear()
+        self.sasl.clear()
+        try self.command.raw("AUTHENTICATE ")
+        try self.command.raw(mechanism)
+        var encoded: Bytes
+        defer encoded.close()
+        try put_base64(answer, &encoded)
+        if self.has("SASL-IR"):
+            try self.command.raw(" ")
+            try self.command.text.put(encoded.view())
+            self.sasl_sent = true
+        else:
+            try self.sasl.put(encoded.view())
+        defer self.sasl.clear()
+        self.run(Collect.nothing) catch failure:
+            if failure.code == rejected:
+                error(authentication, self.text())
+            error(failure.code, failure.message)
+        try self.after_login()
+
+    mutating func after_login() -> !:
+        self.authenticated = true
+        if self.capabilities.used == 0 or not self.has("IMAP4REV1") and not self.has("IMAP4REV2"):
+            try self.simple("CAPABILITY")
+        if self.has("UTF8=ACCEPT") and self.has("ENABLE"):
+            try self.simple("ENABLE UTF8=ACCEPT")
+
+    ## Ask the server for news (NOOP): new messages, expunges and flag changes arrive as
+    ## events.
+    pub mutating func noop() -> !:
+        try self.simple("NOOP")
+
+    ## Say goodbye and close the connection. Failures are ignored: the connection goes.
+    pub mutating func logout():
+        if self.link.is_open():
+            self.simple("LOGOUT") catch failure:
+                recover ()
+        self.close()
+
+    ## Close the connection and give everything back.
+    pub mutating func close():
+        self.link.close()
+        self.reader.close()
+        self.response.close()
+        self.command.close()
+        self.capabilities.close()
+        self.last_text.close()
+        self.sasl.close()
+        self.pool.close()
+        self.mailbox_list.close()
+        self.message_list.close()
+        self.found.close()
+        self.expunged.close()
+        self.changes.close()
+
+    ## Forget the last command's results before a new one collects.
+    mutating func reset_results():
+        self.pool.close()
+        self.mailbox_list.clear()
+        self.message_list.clear()
+        self.found.clear()
+        self.status_result = MailboxStatus()
+        self.appended = 0
+
+## Whether `a` and `b` hold the same bytes.
+func equal(a: const u8[], b: const u8[]) -> bool:
+    if a.length != b.length:
+        return false
+    for index in 0..<a.length:
+        if a[index] != b[index]:
+            return false
+    return true

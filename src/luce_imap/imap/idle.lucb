@@ -1,0 +1,69 @@
+#==============================================================================================
+#
+#   imap/idle - Waiting for the server to say something changed
+#
+#   DESCRIPTION:
+#       IDLE (RFC 2177) lets the server push EXISTS, EXPUNGE and FETCH responses for the
+#       selected mailbox as they happen. `idle` waits up to a time limit, or until the
+#       session's cancellation is signalled, then ends the IDLE with DONE. Servers drop an
+#       IDLE after about 30 minutes, so clients idle for less (RFC 2177 suggests 29) and
+#       start again. Without IDLE a client polls with `noop`.
+#
+#==============================================================================================
+
+extend Session:
+    ## Wait up to `nanoseconds` for news in the selected mailbox; whether there is any
+    ## (see `has_events`). A cancellation ends the wait with `net.cancelled` and leaves
+    ## the session closed, since IDLE cannot be finished cleanly from another thread.
+    pub mutating func idle(nanoseconds: u64) -> bool!:
+        try self.require_selected()
+        if not self.has("IDLE"):
+            try self.noop()
+            return self.has_events()
+        self.tag_number += 1
+        var tag: Bytes
+        defer tag.close()
+        try tag.byte('a')
+        try tag.number(self.tag_number)
+        var line: Bytes
+        defer line.close()
+        try line.put(tag.view())
+        try line.put(b" IDLE\r\n")
+        try self.link.write(line.view())
+        # The server says `+ idling`, perhaps after some news.
+        while true:
+            let raw = try self.reader.read(&self.link)
+            try self.response.parse(raw)
+            if self.response.is_continuation():
+                break
+            if self.response.is_untagged():
+                try self.absorb()
+                continue
+            if equal(self.response.tag, tag.view()):
+                try self.complete()
+                return self.has_events()
+        let deadline = time.now() + nanoseconds
+        while not self.has_events():
+            let now = time.now()
+            if now >= deadline:
+                break
+            if not self.reader.pending():
+                let ready = self.link.wait(deadline - now) catch failure:
+                    self.close()
+                    error(failure.code, failure.message)
+                if not ready:
+                    break
+            let raw = try self.reader.read(&self.link)
+            try self.response.parse(raw)
+            if self.response.is_untagged():
+                try self.absorb()
+        try self.link.write(b"DONE\r\n")
+        while true:
+            let raw = try self.reader.read(&self.link)
+            try self.response.parse(raw)
+            if self.response.is_untagged():
+                try self.absorb()
+                continue
+            if equal(self.response.tag, tag.view()):
+                try self.complete()
+                return self.has_events()

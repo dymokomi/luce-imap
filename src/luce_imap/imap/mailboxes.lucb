@@ -1,0 +1,175 @@
+#==============================================================================================
+#
+#   imap/mailboxes - LIST and STATUS
+#
+#   DESCRIPTION:
+#       `list` finds every mailbox with its hierarchy delimiter and its attributes,
+#       including the special-use roles (RFC 6154: \Sent, \Drafts, \Trash, \Junk,
+#       \Archive, \All, \Flagged) when the server marks them. Names arrive in modified
+#       UTF-7 or UTF-8; a Mailbox keeps both the name to show and the name to send back.
+#       `status` asks one mailbox for its counts without selecting it.
+#
+#==============================================================================================
+
+## A mailbox's attributes, as bits.
+pub enum MailboxFlags as u32:
+    empty = 0
+    no_select = 1
+    no_inferiors = 2
+    has_children = 4
+    has_no_children = 8
+    marked = 16
+    unmarked = 32
+    nonexistent = 64
+    subscribed = 128
+    all = 256
+    archive = 512
+    drafts = 1024
+    flagged = 2048
+    junk = 4096
+    sent = 8192
+    trash = 16384
+    important = 32768
+
+## The attribute names LIST may give, with their bits.
+let mailbox_attributes: (str, u32)[17] = [
+    ("\\Noselect", 1), ("\\NonExistent", 64 | 1), ("\\Noinferiors", 2), ("\\HasChildren", 4),
+    ("\\HasNoChildren", 8), ("\\Marked", 16), ("\\Unmarked", 32), ("\\Subscribed", 128),
+    ("\\All", 256), ("\\AllMail", 256), ("\\Archive", 512), ("\\Drafts", 1024), ("\\Flagged", 2048),
+    ("\\Junk", 4096), ("\\Spam", 4096), ("\\Sent", 8192), ("\\Trash", 16384),
+]
+
+## One mailbox a LIST found. Text views last until the next command.
+pub struct Mailbox:
+    ## The name to show, UTF-8: `Archive/2026`.
+    pub var name: str
+    ## The name to give back in commands, as the server wrote it.
+    pub var path: const u8[]
+    ## The hierarchy delimiter, or zero for a flat name space.
+    pub var delimiter: u8
+    pub var flags: MailboxFlags
+
+    ## Whether the mailbox has attribute `flag`.
+    pub func is(flag: MailboxFlags) -> bool:
+        return (self.flags & flag) != MailboxFlags.empty
+
+## A mailbox's counts from STATUS; a count the server did not give is zero.
+pub struct MailboxStatus:
+    pub var messages: u32
+    pub var recent: u32
+    pub var unseen: u32
+    pub var uid_next: u32
+    pub var uid_validity: u32
+    pub var highest_modseq: u64
+
+extend Session:
+    ## List every mailbox under `reference` matching `pattern` (`*` for all), with
+    ## special-use roles when the server offers them.
+    pub mutating func list(reference: str = "", pattern: str = "*") -> const Mailbox[]!:
+        self.reset_results()
+        self.command.clear()
+        try self.command.raw("LIST ")
+        try self.command.string(reference.bytes)
+        try self.command.raw(" ")
+        try self.command.string(pattern.bytes)
+        if self.has("SPECIAL-USE") and self.has("LIST-EXTENDED"):
+            try self.command.raw(" RETURN (SPECIAL-USE)")
+        try self.run(Collect.mailboxes)
+        return self.mailbox_list.view()
+
+    ## The mailboxes the last `list` found.
+    pub func mailboxes() -> const Mailbox[]:
+        return self.mailbox_list.view()
+
+    ## Take in a LIST response: `* LIST (\HasNoChildren) "/" "Sent Items"`.
+    mutating func read_list() -> !:
+        let response = &self.response
+        let attributes = response.at(response.values, 0) else error(protocol, "a LIST response without attributes")
+        let delimiter_node = response.at(response.values, 1) else error(protocol, "a LIST response without a delimiter")
+        let name_node = response.at(response.values, 2) else error(protocol, "a LIST response without a name")
+        var flags = MailboxFlags.empty
+        var current = response.first(attributes)
+        while let attribute = current:
+            for entry in mailbox_attributes:
+                if same(response.bytes(attribute), entry.0.bytes):
+                    flags = flags | (MailboxFlags)entry.1
+            current = response.next(attribute)
+        var delimiter: u8 = 0
+        if response.kind(delimiter_node) == Kind.string:
+            var text: Bytes
+            defer text.close()
+            try response.string(delimiter_node, &text)
+            if text.used == 1:
+                delimiter = text.view()[0]
+        var path: Bytes
+        defer path.close()
+        try response.string(name_node, &path)
+        var shown: Bytes
+        defer shown.close()
+        if self.command.utf8:
+            try shown.put(path.view())
+        else:
+            try decode_mailbox(path.view(), &shown)
+        let kept_path = try self.pool.keep(path.view())
+        let kept_name = try self.pool.keep(shown.view())
+        let name = (str)kept_name if utf8.valid(kept_name) else (str)kept_path
+        try self.mailbox_list.add(Mailbox(name = name, path = kept_path, delimiter = delimiter, flags = flags))
+
+    ## The counts of mailbox `name` (UTF-8), without selecting it.
+    pub mutating func status(name: str) -> MailboxStatus!:
+        self.reset_results()
+        self.command.clear()
+        try self.command.raw("STATUS ")
+        try self.command.mailbox(name.bytes)
+        try self.command.raw(" (MESSAGES UNSEEN UIDNEXT UIDVALIDITY")
+        if self.has("CONDSTORE"):
+            try self.command.raw(" HIGHESTMODSEQ")
+        try self.command.raw(")")
+        try self.run(Collect.status)
+        return self.status_result
+
+    ## Take in a STATUS response: `* STATUS INBOX (MESSAGES 3 UIDNEXT 4)`.
+    mutating func read_status():
+        let response = &self.response
+        let items = response.at(response.values, 1) else return
+        var current = response.first(items)
+        while let item = current:
+            let value = response.next(item) else return
+            let number = response.number_of(value) else 0
+            let name = response.bytes(item)
+            if same(name, b"MESSAGES"):
+                self.status_result.messages = (u32)number
+            elif same(name, b"RECENT"):
+                self.status_result.recent = (u32)number
+            elif same(name, b"UNSEEN"):
+                self.status_result.unseen = (u32)number
+            elif same(name, b"UIDNEXT"):
+                self.status_result.uid_next = (u32)number
+            elif same(name, b"UIDVALIDITY"):
+                self.status_result.uid_validity = (u32)number
+            elif same(name, b"HIGHESTMODSEQ"):
+                self.status_result.highest_modseq = number
+            current = response.next(value)
+
+    ## Create mailbox `name` (UTF-8).
+    pub mutating func create(name: str) -> !:
+        self.command.clear()
+        try self.command.raw("CREATE ")
+        try self.command.mailbox(name.bytes)
+        try self.run(Collect.nothing)
+
+    ## Delete mailbox `name` (UTF-8).
+    pub mutating func delete(name: str) -> !:
+        self.command.clear()
+        try self.command.raw("DELETE ")
+        try self.command.mailbox(name.bytes)
+        try self.run(Collect.nothing)
+
+    ## Rename mailbox `current` to `renamed` (UTF-8).
+    pub mutating func rename(current: str, renamed: str) -> !:
+        self.command.clear()
+        try self.command.raw("RENAME ")
+        try self.command.mailbox(current.bytes)
+        try self.command.raw(" ")
+        try self.command.mailbox(renamed.bytes)
+        try self.run(Collect.nothing)

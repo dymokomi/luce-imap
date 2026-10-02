@@ -1,0 +1,85 @@
+#==============================================================================================
+#
+#   imap/link - The connection, read and written under deadlines
+#
+#   DESCRIPTION:
+#       A Link owns one luce-tls Stream: plain, TLS from the start (port 993), or upgraded
+#       in place by STARTTLS (port 143). Every read and write waits at most the link's
+#       timeout and stops at once when its cancellation is signalled (a worker's
+#       shutdown), and a long wait for the server (IDLE) uses `wait`.
+#
+#==============================================================================================
+
+## The default time any one read or write may take.
+pub let default_timeout: u64 = 60 * 1000000000
+
+## How the connection is protected.
+pub enum Security as u8:
+    ## No TLS: only for a local test server.
+    plain = 0
+    ## Plain at first, upgraded by STARTTLS before login.
+    starttls = 1
+    ## TLS from the first byte.
+    tls = 2
+
+## One connection to a server.
+pub struct Link:
+    var stream: tls_stream.Stream
+    ## Nanoseconds any one read or write may take.
+    pub var timeout: u64
+    var cancellation: sync.Cancellation*?
+    var open: bool
+
+    ## Connect to `host` on `port`, with TLS from the start when `tls`. `cancellation`,
+    ## when given, must outlive the link.
+    pub static func connect(host: str, port: u16, tls: bool, timeout: u64 = default_timeout, cancellation: sync.Cancellation*? = none, trust: tls_stream.Trust = tls_stream.Trust()) -> Link!:
+        let deadline = try net.Deadline.after(timeout)
+        let stream = try tls_stream.Stream.connect(host, port, tls, deadline, cancellation, policy = trust)
+        return Link(stream = stream, timeout = timeout, cancellation = cancellation, open = true)
+
+    ## A link over an already connected `connection`, plain.
+    pub static func over(connection: net.Connection, timeout: u64 = default_timeout, cancellation: sync.Cancellation*? = none) -> Link:
+        return Link(stream = tls_stream.Stream.plain(connection), timeout = timeout, cancellation = cancellation, open = true)
+
+    ## Whether the link is open.
+    pub func is_open() -> bool:
+        return self.open
+
+    ## Whether the link is protected by TLS.
+    pub func is_secure() -> bool:
+        return self.stream.is_secure()
+
+    ## Upgrade the plain link to TLS in place (STARTTLS), checking `host`'s certificate.
+    pub mutating func start_tls(host: str, trust: tls_stream.Trust = tls_stream.Trust()) -> !:
+        self.stream.set_deadline(try net.Deadline.after(self.timeout), self.cancellation)
+        try self.stream.start_tls(host, trust)
+
+    ## Read some bytes, waiting at most the timeout; zero at the end of the stream.
+    pub mutating func read(buffer: u8[]) -> usize!:
+        if not self.open:
+            error(disconnected, "the connection is closed")
+        return try self.stream.read_within(buffer, try net.Deadline.after(self.timeout), self.cancellation)
+
+    ## Write all of `data`, waiting at most the timeout for the whole of it.
+    pub mutating func write(data: const u8[]) -> !:
+        if not self.open:
+            error(disconnected, "the connection is closed")
+        try self.stream.write_within(data, try net.Deadline.after(self.timeout), self.cancellation)
+
+    ## Wait until the server sends something or `nanoseconds` pass; whether it did.
+    ## Cancellation ends the wait with `net.cancelled`.
+    pub mutating func wait(nanoseconds: u64) -> bool!:
+        if not self.open:
+            error(disconnected, "the connection is closed")
+        let readiness = self.stream.wait(net.WaitInterest.read, try net.Deadline.after(nanoseconds), self.cancellation) catch failure:
+            if failure.code == net.timed_out:
+                recover net.Readiness()
+            error(failure.code, failure.message)
+        return readiness.readable or readiness.hangup
+
+    ## Close the connection, saying goodbye to TLS first; repeated close is harmless.
+    pub mutating func close():
+        if self.open:
+            self.stream.close() catch failure:
+                self.stream.destroy()
+            self.open = false

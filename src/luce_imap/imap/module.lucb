@@ -1,0 +1,65 @@
+#==============================================================================================
+#
+#   imap - An IMAP client
+#
+#   DESCRIPTION:
+#       A Session speaks IMAP4rev1 (RFC 3501) and IMAP4rev2 (RFC 9051) to one server: it
+#       reads the greeting and capabilities, logs in, lists mailboxes, selects one and
+#       keeps its state (EXISTS, UIDVALIDITY, UIDNEXT, HIGHESTMODSEQ), and runs commands by
+#       UID. Each command's results stay in the session until the next command: the
+#       mailboxes a LIST found, the messages a FETCH returned, the UIDs a SEARCH matched.
+#       Untagged responses that arrive at any time (EXISTS, EXPUNGE, FETCH FLAGS) update
+#       the state and are kept as events for a client to apply.
+#
+#       The connection is a luce-tls Stream: plain, TLS from the start, or STARTTLS.
+#       All I/O has a deadline and may be cancelled from another thread, so a client on a
+#       worker can wait in IDLE and still quit at once. The session never retries; a
+#       failure leaves it for the caller to reconnect.
+#
+#       Fragments, in ORDER:
+#
+#       module.lucb      imports, error codes, limits
+#       buffer.lucb      Bytes: a growable byte buffer; Words: a growable u32 list
+#       link.lucb        Link: the connection, read and written under deadlines
+#       utf7.lucb        mailbox names in modified UTF-7 (RFC 3501 §5.1.3)
+#       response.lucb    one response read off the wire and parsed into values
+#       arguments.lucb   command arguments: atoms, quoted strings, literals, sets
+#       session.lucb     Session: commands run, responses dispatched, state kept
+#       mailboxes.lucb   LIST and STATUS
+#       messages.lucb    SELECT, FETCH, SEARCH, STORE, COPY, MOVE, EXPUNGE, APPEND
+#       idle.lucb        IDLE
+#       tests*.lucb      tests over parsed transcripts and a scripted loopback server
+#
+#==============================================================================================
+
+import io
+import memory
+import net
+import strings
+import sync
+import thread
+import time
+import tls_stream
+import utf8
+
+## The server answered NO: the command was understood and refused.
+pub let rejected: ErrorCode = ErrorCode.package(1)
+## The server answered BAD: the command was not understood.
+pub let bad_command: ErrorCode = ErrorCode.package(2)
+## The server said BYE, or closed the connection.
+pub let disconnected: ErrorCode = ErrorCode.package(3)
+## The server sent something that is not IMAP.
+pub let protocol: ErrorCode = ErrorCode.package(4)
+## The server does not offer what was asked: a capability, an authentication method.
+pub let unsupported: ErrorCode = ErrorCode.package(5)
+## A response or a literal past what this client accepts.
+pub let limit_exceeded: ErrorCode = ErrorCode.package(6)
+## Login failed: the server refused the credentials.
+pub let authentication: ErrorCode = ErrorCode.package(7)
+## A command needs a mailbox to be selected first.
+pub let not_selected: ErrorCode = ErrorCode.package(8)
+
+## The longest response line accepted, literals aside.
+pub let maximum_line: usize = 1024 * 1024
+## The largest literal accepted: one message.
+pub let maximum_literal: usize = 256 * 1024 * 1024

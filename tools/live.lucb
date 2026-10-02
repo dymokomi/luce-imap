@@ -1,0 +1,27 @@
+## A live check against a real server, not part of CI:
+##     luce-base build tools/live.lucb --native -o build/live
+##     build/live HOST PORT plain|starttls|tls USER PASSWORD
+## Lists the mailboxes, selects INBOX and shows the newest messages' subjects.
+import imap
+import strings
+
+pub func main(arguments: str[]) -> i32!:
+    if arguments.length < 6:
+        print("usage: live HOST PORT plain|starttls|tls USER PASSWORD")
+        return 2
+    let port = strings.parse_u64(arguments[2]) else trap("bad port")
+    let security = imap.Security.tls if arguments[3] == "tls" else (imap.Security.starttls if arguments[3] == "starttls" else imap.Security.plain)
+    var session = try imap.Session.open(arguments[1], u16(port), security)
+    defer session.close()
+    let idle = session.has("IDLE")
+    print(f"connected, secure: {session.is_secure()}, IDLE: {idle}")
+    try session.login(arguments[4], arguments[5])
+    for mailbox in try session.list():
+        print(f"  {mailbox.name}")
+    let state = try session.select("INBOX")
+    print(f"INBOX: {state.exists} messages, UIDVALIDITY {state.uid_validity}, UIDNEXT {state.uid_next}")
+    if state.exists > 0:
+        for record in try session.fetch_headers("1:*", "SUBJECT FROM"):
+            print(f"  uid {record.uid} size {record.size}: {(str)record.header}")
+    session.logout()
+    return 0
