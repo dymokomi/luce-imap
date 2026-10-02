@@ -63,6 +63,9 @@ pub struct Session:
     var expunged: Words
     var changes: Records[Fetched]
     var exists_changed: bool
+    # IDLE in progress: its tag.
+    var idling: bool
+    var idle_tag: Bytes
 
     ## Connect to `host`, read the greeting, upgrade with STARTTLS when `security` asks
     ## for it, and learn the capabilities.
@@ -436,6 +439,7 @@ pub struct Session:
         self.found.close()
         self.expunged.close()
         self.changes.close()
+        self.idle_tag.close()
 
     ## Forget the last command's results before a new one collects.
     mutating func reset_results():

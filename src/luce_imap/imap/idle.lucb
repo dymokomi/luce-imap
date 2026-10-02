@@ -4,30 +4,28 @@
 #
 #   DESCRIPTION:
 #       IDLE (RFC 2177) lets the server push EXISTS, EXPUNGE and FETCH responses for the
-#       selected mailbox as they happen. `idle` waits up to a time limit, or until the
-#       session's cancellation is signalled, then ends the IDLE with DONE. Servers drop an
-#       IDLE after about 30 minutes, so clients idle for less (RFC 2177 suggests 29) and
-#       start again. Without IDLE a client polls with `noop`.
+#       selected mailbox as they happen. A client starts it (`idle_start`), waits in
+#       slices (`idle_wait`) so it can look at its own work between them, and ends it with
+#       DONE (`idle_done`); `idle` does all three for one wait. Servers drop an IDLE after
+#       about 30 minutes, so clients idle for less (RFC 2177 suggests 29) and start again.
+#       Without IDLE a client polls with `noop`.
 #
 #==============================================================================================
 
 extend Session:
-    ## Wait up to `nanoseconds` for news in the selected mailbox; whether there is any
-    ## (see `has_events`). A cancellation ends the wait with `net.cancelled` and leaves
-    ## the session closed, since IDLE cannot be finished cleanly from another thread.
-    pub mutating func idle(nanoseconds: u64) -> bool!:
+    ## Start IDLE in the selected mailbox; false when the server has no IDLE (poll with
+    ## `noop` instead) or the server completed it at once.
+    pub mutating func idle_start() -> bool!:
         try self.require_selected()
         if not self.has("IDLE"):
-            try self.noop()
-            return self.has_events()
+            return false
         self.tag_number += 1
-        var tag: Bytes
-        defer tag.close()
-        try tag.byte('a')
-        try tag.number(self.tag_number)
+        self.idle_tag.clear()
+        try self.idle_tag.byte('a')
+        try self.idle_tag.number(self.tag_number)
         var line: Bytes
         defer line.close()
-        try line.put(tag.view())
+        try line.put(self.idle_tag.view())
         try line.put(b" IDLE\r\n")
         try self.link.write(line.view())
         # The server says `+ idling`, perhaps after some news.
@@ -35,28 +33,39 @@ extend Session:
             let raw = try self.reader.read(&self.link)
             try self.response.parse(raw)
             if self.response.is_continuation():
-                break
+                self.idling = true
+                return true
             if self.response.is_untagged():
                 try self.absorb()
                 continue
-            if equal(self.response.tag, tag.view()):
+            if equal(self.response.tag, self.idle_tag.view()):
                 try self.complete()
-                return self.has_events()
+                return false
+
+    ## While idling, wait up to `nanoseconds` for news; whether there is any (see
+    ## `has_events`). Every response that arrives is taken in.
+    pub mutating func idle_wait(nanoseconds: u64) -> bool!:
+        if not self.idling:
+            error(protocol, "the session is not idling")
         let deadline = time.now() + nanoseconds
         while not self.has_events():
             let now = time.now()
             if now >= deadline:
                 break
             if not self.reader.pending():
-                let ready = self.link.wait(deadline - now) catch failure:
-                    self.close()
-                    error(failure.code, failure.message)
-                if not ready:
+                if not try self.link.wait(deadline - now):
                     break
             let raw = try self.reader.read(&self.link)
             try self.response.parse(raw)
             if self.response.is_untagged():
                 try self.absorb()
+        return self.has_events()
+
+    ## End IDLE with DONE and read its completion.
+    pub mutating func idle_done() -> !:
+        if not self.idling:
+            return
+        self.idling = false
         try self.link.write(b"DONE\r\n")
         while true:
             let raw = try self.reader.read(&self.link)
@@ -64,6 +73,17 @@ extend Session:
             if self.response.is_untagged():
                 try self.absorb()
                 continue
-            if equal(self.response.tag, tag.view()):
+            if equal(self.response.tag, self.idle_tag.view()):
                 try self.complete()
-                return self.has_events()
+                return
+
+    ## Wait up to `nanoseconds` for news in the selected mailbox with IDLE (or one NOOP
+    ## when the server lacks it); whether there is any.
+    pub mutating func idle(nanoseconds: u64) -> bool!:
+        if not try self.idle_start():
+            if not self.has("IDLE"):
+                try self.noop()
+            return self.has_events()
+        discard(try self.idle_wait(nanoseconds))
+        try self.idle_done()
+        return self.has_events()
