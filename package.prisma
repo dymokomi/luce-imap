@@ -1,25 +1,22 @@
 #prisma 4.0
 def package "luce-imap" {
     str owner = "dymokomi"
-    str version = "0.1.3"
+    str version = "0.2.0"
     str kind = "package"
     str language = "luce-base"
     str description = "An IMAP4rev1/rev2 client in luce-base: literals and the full response grammar, SASL PLAIN/XOAUTH2, LIST with special-use roles, SELECT, UID FETCH/SEARCH/STORE/MOVE, APPEND and IDLE, over plain, TLS or STARTTLS."
     str readme = "README.md"
-
-    def export "imap" {
-        str module = "luce_imap.imap"
-    }
+    str[] public = ["imap"]
 
     def dependency "luce-tls" {
         str owner = "dymokomi"
-        str version = "^0.1.4"
+        str version = "^0.2.0"
         str path = "../luce-tls"
     }
 
     def dependency "luce-std" {
         str owner = "dymokomi"
-        str version = "^0.1.5"
+        str version = "^0.2.0"
         str path = "../luce-std"
     }
 }
