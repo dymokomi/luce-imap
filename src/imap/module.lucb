@@ -34,13 +34,13 @@
 
 import io
 import memory
-import luce_std.net
+from luce_std import net
 import strings
 import sync
 import thread
 import time
-import luce_tls.stream as tls_stream
-import luce_std.utf8
+from luce_tls import stream as tls_stream
+from luce_std import utf8
 
 ## The server answered NO: the command was understood and refused.
 pub let rejected: ErrorCode = ErrorCode.package(1)

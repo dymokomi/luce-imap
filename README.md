@@ -8,7 +8,7 @@ The connection is a [luce-tls](https://github.com/dymokomi/luce-tls) `Stream`:
 TLS from the start (993), STARTTLS (143), or plain for a local test server.
 
 ```luce-base
-import luce_imap.imap
+from luce_imap import imap
 
 var session = try imap.Session.open("imap.example.com", 993, imap.Security.tls)
 defer session.close()
