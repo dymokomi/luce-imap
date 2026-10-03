@@ -55,7 +55,7 @@ caller reconnects.
 ./test.sh          # parser tests and sessions against a scripted loopback server
 ```
 
-`tools/live.lucb` runs against a real server: `luce-base build tools/live.lucb
+`dev/live.lucb` runs against a real server: `luce-base build dev/live.lucb
 --native -o build/live`, then `build/live HOST PORT plain|starttls|tls USER
 PASSWORD`. luced-message's `tools/test-server.sh` starts a local GreenMail.
 

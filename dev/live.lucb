@@ -1,5 +1,5 @@
 ## A live check against a real server, not part of CI:
-##     luce-base build tools/live.lucb --native -o build/live
+##     luce-base build dev/live.lucb --native -o build/live
 ##     build/live HOST PORT plain|starttls|tls USER PASSWORD
 ## Lists the mailboxes, selects INBOX and shows the newest messages' subjects.
 import imap
