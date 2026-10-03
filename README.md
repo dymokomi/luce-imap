@@ -43,7 +43,7 @@ caller reconnects.
 | `list(reference, pattern)`, `status(name)`, `create`, `delete`, `rename` | mailboxes |
 | `select(name, read_only)`, `unselect()` | the selected mailbox's state in `selected` |
 | `fetch(set, items, changed_since)`, `fetch_headers(set, fields)`, `fetch_message(uid)` | messages by UID |
-| `search(criteria)` | UIDs, ascending |
+| `search(criteria)`, `search_text(text)` | UIDs, ascending; text search sends UTF-8 as needed |
 | `store(set, flags, add)`, `copy(set, name)`, `move(set, name)`, `expunge(set)` | changes by UID |
 | `append(name, data, flags)` | a message added; its UID with UIDPLUS |
 | `noop()`, `idle(nanoseconds)`, `has_events()`, `expunges()`, `flag_changes()`, `take_events()` | news |

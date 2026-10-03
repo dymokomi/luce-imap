@@ -164,6 +164,26 @@ test "a session lists, selects, fetches, searches, changes, appends and idles":
     assert(session.selected.exists == 7)
     try finish_script(&script, handle)
 
+let searching_steps: Step[5] = [
+    Step(expect = "LOGIN alice secret", reply = "TAG OK Logged in\r\n"),
+    Step(expect = "SELECT INBOX", reply = "* 3 EXISTS\r\n* OK [UIDVALIDITY 1] ok\r\nTAG OK Selected\r\n"),
+    Step(expect = "UID SEARCH TEXT \"plan \\\"Q3\\\"\"", reply = "* SEARCH 9 4\r\nTAG OK Search done\r\n"),
+    Step(expect = "UID SEARCH CHARSET UTF-8 TEXT {12}", reply = "+ go on\r\n"),
+    Step(expect = "Привет", reply = "* SEARCH 7\r\nTAG OK Search done\r\n"),
+]
+
+test "text search quotes ASCII and sends other text as a UTF-8 literal":
+    var script = Script(greeting = "* OK [CAPABILITY IMAP4rev1] Ready\r\n", steps = searching_steps)
+    var (session, handle) = try start_script(&script)
+    defer session.close()
+    try session.login("alice", "secret")
+    discard(try session.select("INBOX"))
+    let found = try session.search_text("plan \"Q3\"")
+    assert(found.length == 2 and found[0] == 4 and found[1] == 9)
+    let cyrillic = try session.search_text("Привет")
+    assert(cyrillic.length == 1 and cyrillic[0] == 7)
+    try finish_script(&script, handle)
+
 let refusing_steps: Step[3] = [
     Step(expect = "CAPABILITY", reply = "* CAPABILITY IMAP4rev1 LITERAL+\r\nTAG OK Capability done\r\n"),
     Step(expect = "LOGIN alice \"wrong pass\"", reply = "TAG NO [AUTHENTICATIONFAILED] Invalid credentials\r\n"),

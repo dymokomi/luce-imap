@@ -251,6 +251,28 @@ extend Session:
         sort(self.found.data[0..<self.found.used])
         return self.found.view()
 
+    ## The UIDs of the messages whose header or body holds `text` (SEARCH TEXT), in
+    ## ascending order. Text outside ASCII is sent as UTF-8 (CHARSET UTF-8, as a literal
+    ## unless the server accepts UTF-8 in quoted strings).
+    pub mutating func search_text(text: str) -> const u32[]!:
+        try self.require_selected()
+        self.reset_results()
+        self.command.clear()
+        try self.command.raw("UID SEARCH ")
+        if self.has("ESEARCH"):
+            try self.command.raw("RETURN (ALL) ")
+        var ascii = true
+        for byte in text.bytes:
+            if byte >= 0x80:
+                ascii = false
+        if not ascii and not self.command.utf8:
+            try self.command.raw("CHARSET UTF-8 ")
+        try self.command.raw("TEXT ")
+        try self.command.string(text.bytes)
+        try self.run(Collect.search)
+        sort(self.found.data[0..<self.found.used])
+        return self.found.view()
+
     ## Take in an ESEARCH response: `* ESEARCH (TAG "a5") UID ALL 4:19,21`.
     mutating func read_esearch() -> !:
         let response = &self.response
