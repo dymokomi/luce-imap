@@ -69,7 +69,7 @@ pub struct Session:
 
     ## Connect to `host`, read the greeting, upgrade with STARTTLS when `security` asks
     ## for it, and learn the capabilities.
-    pub func open(host: str, port: u16, security: Security, timeout: u64 = default_timeout, cancellation: sync.Cancellation*? = none, trust: tls_stream.Trust = tls_stream.Trust()) -> Session!:
+    pub static func open(host: str, port: u16, security: Security, timeout: u64 = default_timeout, cancellation: sync.Cancellation*? = none, trust: tls_stream.Trust = tls_stream.Trust()) -> Session!:
         let link = try Link.connect(host, port, security == Security.tls, timeout, cancellation, trust)
         var session = Session(link = link, selected = Selected(), collect = Collect.nothing)
         errdefer session.close()
@@ -86,7 +86,7 @@ pub struct Session:
         return session
 
     ## A session over an already connected, plain `link` (tests, proxies).
-    pub func over(link: Link) -> Session!:
+    pub static func over(link: Link) -> Session!:
         var session = Session(link = link, selected = Selected(), collect = Collect.nothing)
         errdefer session.close()
         try session.greet()

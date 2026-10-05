@@ -32,13 +32,13 @@ pub struct Link:
 
     ## Connect to `host` on `port`, with TLS from the start when `tls`. `cancellation`,
     ## when given, must outlive the link.
-    pub func connect(host: str, port: u16, tls: bool, timeout: u64 = default_timeout, cancellation: sync.Cancellation*? = none, trust: tls_stream.Trust = tls_stream.Trust()) -> Link!:
+    pub static func connect(host: str, port: u16, tls: bool, timeout: u64 = default_timeout, cancellation: sync.Cancellation*? = none, trust: tls_stream.Trust = tls_stream.Trust()) -> Link!:
         let deadline = try net.Deadline.after(timeout)
         let stream = try tls_stream.Stream.connect(host, port, tls, deadline, cancellation, policy = trust)
         return Link(stream = stream, timeout = timeout, cancellation = cancellation, open = true)
 
     ## A link over an already connected `connection`, plain.
-    pub func over(connection: net.Connection, timeout: u64 = default_timeout, cancellation: sync.Cancellation*? = none) -> Link:
+    pub static func over(connection: net.Connection, timeout: u64 = default_timeout, cancellation: sync.Cancellation*? = none) -> Link:
         return Link(stream = tls_stream.Stream.plain(connection), timeout = timeout, cancellation = cancellation, open = true)
 
     ## Whether the link is open.
