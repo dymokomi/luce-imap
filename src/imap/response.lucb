@@ -146,12 +146,12 @@ pub struct Response:
 
     # mark: parsing ==============================================================================
 
-    mutating func add(kind: Kind, start: usize, end: usize) -> usize!:
+    func add(kind: Kind, start: usize, end: usize) -> usize!:
         if self.node_count == self.nodes.length:
             if self.node_count >= maximum_nodes:
                 error(limit_exceeded, "the response has too many values")
             let capacity: usize = 64 if self.nodes.length == 0 else self.nodes.length * 2
-            let grown = try alloc Node[capacity] in memory.heap
+            let grown = try new Node[capacity] --- in memory.heap
             for index in 0..<self.node_count:
                 grown[index] = self.nodes[index]
             if self.nodes.length > 0:
@@ -162,7 +162,7 @@ pub struct Response:
         return self.node_count - 1
 
     ## Make `child` the last child of list `list`, after `last` (none when it is first).
-    mutating func link(list: usize, last: usize?, child: usize):
+    func link(list: usize, last: usize?, child: usize):
         if let previous = last:
             self.nodes[previous].next = u32(child + 1)
         else:
@@ -170,7 +170,7 @@ pub struct Response:
         self.nodes[list].count += 1
 
     ## Parse `raw`, one whole response with its CRLF. Views point into `raw`.
-    pub mutating func parse(raw: const u8[]) -> !:
+    pub func parse(raw: const u8[]) -> !:
         self.raw = raw
         self.node_count = 0
         self.status = Status.data
@@ -232,7 +232,7 @@ pub struct Response:
             last = value
 
     ## Parse the value at the cursor; in a response code `]` ends an atom.
-    mutating func value(cursor: Cursor*, in_code: bool) -> usize!:
+    func value(cursor: Cursor*, in_code: bool) -> usize!:
         let byte = cursor.peek()
         if byte == '(':
             cursor.index += 1
@@ -294,7 +294,7 @@ pub struct Response:
         return try self.add(Kind.number if digits else Kind.atom, start, cursor.index)
 
     ## Give the node table back.
-    pub mutating func close():
+    pub func close():
         if self.nodes.length > 0:
             free(self.nodes) in memory.heap
         var empty: Node[]
@@ -335,12 +335,12 @@ struct Cursor:
         return byte >= '0' and byte <= '9'
 
     ## Skip spaces.
-    mutating func space():
+    func space():
         while self.index < self.data.length and self.data[self.index] == ' ':
             self.index += 1
 
     ## Take `text` when it is next.
-    mutating func expect(text: const u8[]) -> bool:
+    func expect(text: const u8[]) -> bool:
         if self.data.length - self.index >= text.length:
             for offset in 0..<text.length:
                 if self.data[self.index + offset] != text[offset]:
@@ -350,14 +350,14 @@ struct Cursor:
         return false
 
     ## The run up to the next space or line end.
-    mutating func word() -> const u8[]:
+    func word() -> const u8[]:
         let start = self.index
         while self.peek() != 0 and self.peek() != ' ':
             self.index += 1
         return self.data[start..<self.index]
 
     ## A response code's name: up to a space or `]`.
-    mutating func code_atom() -> const u8[]:
+    func code_atom() -> const u8[]:
         let start = self.index
         while self.peek() != 0 and self.peek() != ' ' and self.peek() != ']':
             self.index += 1
@@ -365,7 +365,7 @@ struct Cursor:
 
     ## An atom: up to a space, a parenthesis or the line end, with a bracketed section
     ## (which may hold spaces) kept whole. In a response code `]` ends it.
-    mutating func atom(in_code: bool) -> const u8[]:
+    func atom(in_code: bool) -> const u8[]:
         let start = self.index
         var depth: usize = 0
         while true:
@@ -386,7 +386,7 @@ struct Cursor:
         return self.data[start..<self.index]
 
     ## The rest of the line.
-    mutating func rest() -> const u8[]:
+    func rest() -> const u8[]:
         let start = self.index
         while self.peek() != 0:
             self.index += 1
@@ -401,7 +401,7 @@ pub struct Reader:
     var current: Bytes
 
     ## Read one whole response from `link` into `current`.
-    pub mutating func read(link: Link*) -> const u8[]!:
+    pub func read(link: Link*) -> const u8[]!:
         self.current.clear()
         while true:
             let line_start = self.current.used
@@ -412,7 +412,7 @@ pub struct Reader:
             try self.exactly(link, length)
 
     ## Append one line, CRLF included, to `current`.
-    mutating func line(link: Link*) -> !:
+    func line(link: Link*) -> !:
         # Bytes after `start` already searched for the line end.
         var searched: usize = 0
         while true:
@@ -432,7 +432,7 @@ pub struct Reader:
             try self.fill(link)
 
     ## Append exactly `count` bytes to `current`.
-    mutating func exactly(link: Link*, count: usize) -> !:
+    func exactly(link: Link*, count: usize) -> !:
         if count > maximum_literal:
             error(limit_exceeded, "a literal is larger than this client accepts")
         var remaining = count
@@ -447,7 +447,7 @@ pub struct Reader:
             remaining -= take
 
     ## Read more from `link`, first moving the unread bytes to the front.
-    mutating func fill(link: Link*) -> !:
+    func fill(link: Link*) -> !:
         if self.start > 0:
             let unread = self.buffer.used - self.start
             memory.move(self.buffer.data, self.buffer.data[self.start..], unread)
@@ -464,7 +464,7 @@ pub struct Reader:
         return self.start < self.buffer.used
 
     ## Give the buffers back.
-    pub mutating func close():
+    pub func close():
         self.buffer.close()
         self.current.close()
         self.start = 0

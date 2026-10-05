@@ -15,7 +15,7 @@
 extend Session:
     ## Start IDLE in the selected mailbox; false when the server has no IDLE (poll with
     ## `noop` instead) or the server completed it at once.
-    pub mutating func idle_start() -> bool!:
+    pub func idle_start() -> bool!:
         try self.require_selected()
         if not self.has("IDLE"):
             return false
@@ -44,7 +44,7 @@ extend Session:
 
     ## While idling, wait up to `nanoseconds` for news; whether there is any (see
     ## `has_events`). Every response that arrives is taken in.
-    pub mutating func idle_wait(nanoseconds: u64) -> bool!:
+    pub func idle_wait(nanoseconds: u64) -> bool!:
         if not self.idling:
             error(protocol, "the session is not idling")
         let deadline = time.now() + nanoseconds
@@ -62,7 +62,7 @@ extend Session:
         return self.has_events()
 
     ## End IDLE with DONE and read its completion.
-    pub mutating func idle_done() -> !:
+    pub func idle_done() -> !:
         if not self.idling:
             return
         self.idling = false
@@ -79,11 +79,11 @@ extend Session:
 
     ## Wait up to `nanoseconds` for news in the selected mailbox with IDLE (or one NOOP
     ## when the server lacks it); whether there is any.
-    pub mutating func idle(nanoseconds: u64) -> bool!:
+    pub func idle(nanoseconds: u64) -> bool!:
         if not try self.idle_start():
             if not self.has("IDLE"):
                 try self.noop()
             return self.has_events()
-        discard(try self.idle_wait(nanoseconds))
+        _ = try self.idle_wait(nanoseconds)
         try self.idle_done()
         return self.has_events()

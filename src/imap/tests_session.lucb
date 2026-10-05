@@ -177,7 +177,7 @@ test "text search quotes ASCII and sends other text as a UTF-8 literal":
     var (session, handle) = try start_script(&script)
     defer session.close()
     try session.login("alice", "secret")
-    discard(try session.select("INBOX"))
+    _ = try session.select("INBOX")
     let found = try session.search_text("plan \"Q3\"")
     assert(found.length == 2 and found[0] == 4 and found[1] == 9)
     let cyrillic = try session.search_text("Привет")

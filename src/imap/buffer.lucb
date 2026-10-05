@@ -13,7 +13,7 @@ pub struct Bytes:
     var data: u8[]
     var used: usize
 
-    mutating func reserve(extra: usize) -> !:
+    func reserve(extra: usize) -> !:
         let needed = self.used +? extra else error(limit_exceeded, "the buffer is too large")
         if needed <= self.data.length:
             return
@@ -27,24 +27,24 @@ pub struct Bytes:
         self.data = grown
 
     ## Append `data`.
-    pub mutating func put(data: const u8[]) -> !:
+    pub func put(data: const u8[]) -> !:
         try self.reserve(data.length)
         memory.copy(self.data[self.used..], data, data.length)
         self.used += data.length
 
     ## Append `text`.
-    pub mutating func text(text: str) -> !:
+    pub func text(text: str) -> !:
         try self.put(text.bytes)
 
     ## Append one byte.
-    pub mutating func byte(value: u8) -> !:
+    pub func byte(value: u8) -> !:
         if self.used == self.data.length:
             try self.reserve(1)
         self.data[self.used] = value
         self.used += 1
 
     ## Append `value` in decimal.
-    pub mutating func number(value: u64) -> !:
+    pub func number(value: u64) -> !:
         var digits: u8[20]
         var count: usize = 0
         var rest = value
@@ -61,11 +61,11 @@ pub struct Bytes:
         return self.data[0..<self.used]
 
     ## Forget the contents, keeping the storage.
-    pub mutating func clear():
+    pub func clear():
         self.used = 0
 
     ## Give the storage back.
-    pub mutating func close():
+    pub func close():
         if self.data.length > 0:
             free(self.data) in memory.heap
         var empty: u8[]
@@ -78,7 +78,7 @@ pub struct Words:
     var used: usize
 
     ## Append `value`.
-    pub mutating func add(value: u32) -> !:
+    pub func add(value: u32) -> !:
         if self.used == self.data.length:
             let capacity: usize = 64 if self.data.length == 0 else self.data.length * 2
             let grown = try new u32[capacity] in memory.heap
@@ -94,11 +94,11 @@ pub struct Words:
         return self.data[0..<self.used]
 
     ## Forget the contents, keeping the storage.
-    pub mutating func clear():
+    pub func clear():
         self.used = 0
 
     ## Give the storage back.
-    pub mutating func close():
+    pub func close():
         if self.data.length > 0:
             free(self.data) in memory.heap
         var empty: u32[]
@@ -132,7 +132,7 @@ pub struct TextPool:
     var used: usize
 
     ## A kept copy of `data`, which stays where it is until the pool closes.
-    pub mutating func keep(data: const u8[]) -> const u8[]!:
+    pub func keep(data: const u8[]) -> const u8[]!:
         if data.length == 0:
             var empty: const u8[]
             return empty
@@ -154,7 +154,7 @@ pub struct TextPool:
         return room
 
     ## Give every chunk back; earlier views become invalid.
-    pub mutating func close():
+    pub func close():
         for index in 0..<self.count:
             free(self.chunks[index]) in memory.heap
         if self.chunks.length > 0:
@@ -189,10 +189,10 @@ pub struct Records[T]:
     var used: usize
 
     ## Append `value`.
-    pub mutating func add(value: T) -> !:
+    pub func add(value: T) -> !:
         if self.used == self.data.length:
             let capacity: usize = 16 if self.data.length == 0 else self.data.length * 2
-            let grown = try alloc T[capacity] in memory.heap
+            let grown = try new T[capacity] --- in memory.heap
             for index in 0..<self.used:
                 grown[index] = self.data[index]
             if self.data.length > 0:
@@ -210,11 +210,11 @@ pub struct Records[T]:
         return self.used
 
     ## Forget the records, keeping the storage.
-    pub mutating func clear():
+    pub func clear():
         self.used = 0
 
     ## Give the storage back.
-    pub mutating func close():
+    pub func close():
         if self.data.length > 0:
             free(self.data) in memory.heap
         var empty: T[]

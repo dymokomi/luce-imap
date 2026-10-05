@@ -116,7 +116,7 @@ extend Session:
 
     ## Select mailbox `name` (UTF-8) to work on its messages; read-only with `read_only`
     ## (EXAMINE). The state is in `selected`.
-    pub mutating func select(name: str, read_only: bool = false) -> Selected!:
+    pub func select(name: str, read_only: bool = false) -> Selected!:
         self.has_selected = false
         self.selected = Selected()
         self.take_events()
@@ -135,7 +135,7 @@ extend Session:
 
     ## Leave the selected mailbox without expunging (UNSELECT, or CLOSE when the server
     ## lacks it, which does expunge).
-    pub mutating func unselect() -> !:
+    pub func unselect() -> !:
         if not self.has_selected:
             return
         try self.simple("UNSELECT" if self.has("UNSELECT") else "CLOSE")
@@ -150,7 +150,7 @@ extend Session:
     ## Fetch `items` (`(UID FLAGS BODY.PEEK[])`) of the messages in UID set `set`
     ## (`1:*`, `5,7:9`); `changed_since` > 0 asks only for messages whose mod-sequence is
     ## newer (CONDSTORE). Records last until the next command.
-    pub mutating func fetch(set: str, items: str, changed_since: u64 = 0) -> const Fetched[]!:
+    pub func fetch(set: str, items: str, changed_since: u64 = 0) -> const Fetched[]!:
         try self.require_selected()
         self.reset_results()
         self.command.clear()
@@ -170,7 +170,7 @@ extend Session:
         return self.message_list.view()
 
     ## Read the current FETCH response into a record.
-    mutating func read_fetch() -> Fetched!:
+    func read_fetch() -> Fetched!:
         let response = &self.response
         var fetched = Fetched(sequence = response.number else 0, flags = Flags.empty)
         let items = response.at(response.values, 0) else return fetched
@@ -212,7 +212,7 @@ extend Session:
 
     ## The headers named in `fields` (`DATE FROM SUBJECT`), plus UID, flags, size and
     ## internal date, of the messages in UID set `set`: what a message list needs.
-    pub mutating func fetch_headers(set: str, fields: str) -> const Fetched[]!:
+    pub func fetch_headers(set: str, fields: str) -> const Fetched[]!:
         var items: Bytes
         defer items.close()
         try items.put(b"(UID FLAGS RFC822.SIZE INTERNALDATE")
@@ -224,7 +224,7 @@ extend Session:
         return try self.fetch(set, (str)items.view())
 
     ## The whole message with UID `uid`, without marking it seen; empty when it is gone.
-    pub mutating func fetch_message(uid: u32) -> const u8[]!:
+    pub func fetch_message(uid: u32) -> const u8[]!:
         var set: Bytes
         defer set.close()
         try set.number(uid)
@@ -239,7 +239,7 @@ extend Session:
 
     ## The UIDs of the messages matching `criteria` (`ALL`, `UNSEEN`, `SINCE 1-Oct-2026`),
     ## in ascending order. They last until the next command.
-    pub mutating func search(criteria: str) -> const u32[]!:
+    pub func search(criteria: str) -> const u32[]!:
         try self.require_selected()
         self.reset_results()
         self.command.clear()
@@ -254,7 +254,7 @@ extend Session:
     ## The UIDs of the messages whose header or body holds `text` (SEARCH TEXT), in
     ## ascending order. Text outside ASCII is sent as UTF-8 (CHARSET UTF-8, as a literal
     ## unless the server accepts UTF-8 in quoted strings).
-    pub mutating func search_text(text: str) -> const u32[]!:
+    pub func search_text(text: str) -> const u32[]!:
         try self.require_selected()
         self.reset_results()
         self.command.clear()
@@ -274,7 +274,7 @@ extend Session:
         return self.found.view()
 
     ## Take in an ESEARCH response: `* ESEARCH (TAG "a5") UID ALL 4:19,21`.
-    mutating func read_esearch() -> !:
+    func read_esearch() -> !:
         let response = &self.response
         var current = response.first(response.values)
         while let item = current:
@@ -287,7 +287,7 @@ extend Session:
     # mark: changing messages ====================================================================
 
     ## Add (`add`) or remove flags `flags` on the messages in UID set `set`, silently.
-    pub mutating func store(set: str, flags: Flags, add: bool) -> !:
+    pub func store(set: str, flags: Flags, add: bool) -> !:
         try self.require_selected()
         self.command.clear()
         try self.command.raw("UID STORE ")
@@ -297,7 +297,7 @@ extend Session:
         try self.run(Collect.nothing)
 
     ## Copy the messages in UID set `set` to mailbox `name` (UTF-8).
-    pub mutating func copy(set: str, name: str) -> !:
+    pub func copy(set: str, name: str) -> !:
         try self.require_selected()
         self.command.clear()
         try self.command.raw("UID COPY ")
@@ -307,7 +307,7 @@ extend Session:
         try self.run(Collect.nothing)
 
     ## Move the messages in UID set `set` to mailbox `name` (UTF-8).
-    pub mutating func move(set: str, name: str) -> !:
+    pub func move(set: str, name: str) -> !:
         try self.require_selected()
         if not self.has("MOVE"):
             try self.copy(set, name)
@@ -323,7 +323,7 @@ extend Session:
 
     ## Remove the messages marked \Deleted: only those in UID set `set` when the server
     ## has UIDPLUS, all of them otherwise (or when `set` is empty).
-    pub mutating func expunge(set: str = "") -> !:
+    pub func expunge(set: str = "") -> !:
         try self.require_selected()
         self.command.clear()
         if set.length > 0 and self.has("UIDPLUS"):
@@ -335,7 +335,7 @@ extend Session:
 
     ## Add message `data` to mailbox `name` (UTF-8) with `flags`; its UID when the server
     ## says (UIDPLUS), zero otherwise.
-    pub mutating func append(name: str, data: const u8[], flags: Flags = Flags.empty) -> u32!:
+    pub func append(name: str, data: const u8[], flags: Flags = Flags.empty) -> u32!:
         self.reset_results()
         self.command.clear()
         try self.command.raw("APPEND ")

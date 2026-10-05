@@ -29,20 +29,20 @@ pub struct Command:
     var utf8: bool
 
     ## Start a new command.
-    mutating func clear():
+    func clear():
         self.text.clear()
         self.cuts.clear()
 
     ## Append protocol text as it is: command names, keywords, parenthesised items.
-    pub mutating func raw(text: str) -> !:
+    pub func raw(text: str) -> !:
         try self.text.text(text)
 
     ## Append a number.
-    pub mutating func number(value: u64) -> !:
+    pub func number(value: u64) -> !:
         try self.text.number(value)
 
     ## Append `data` as a literal.
-    pub mutating func literal(data: const u8[]) -> !:
+    pub func literal(data: const u8[]) -> !:
         try self.text.byte('{')
         try self.text.number((u64)data.length)
         if self.literal_plus:
@@ -53,7 +53,7 @@ pub struct Command:
         try self.text.put(data)
 
     ## Append `data` as a quoted string, or a literal when it cannot be one.
-    pub mutating func string(data: const u8[]) -> !:
+    pub func string(data: const u8[]) -> !:
         for byte in data:
             if byte == 0 or byte == '\r' or byte == '\n' or (byte >= 0x80 and not self.utf8):
                 try self.literal(data)
@@ -66,7 +66,7 @@ pub struct Command:
         try self.text.byte('"')
 
     ## Append `data` as an atom when it can be one, a string otherwise.
-    pub mutating func astring(data: const u8[]) -> !:
+    pub func astring(data: const u8[]) -> !:
         if data.length == 0:
             try self.text.put(b"\"\"")
             return
@@ -77,7 +77,7 @@ pub struct Command:
         try self.text.put(data)
 
     ## Append UTF-8 mailbox name `name`, encoded as the server wants it.
-    pub mutating func mailbox(name: const u8[]) -> !:
+    pub func mailbox(name: const u8[]) -> !:
         if same(name, b"INBOX") or self.utf8:
             try self.astring(name)
             return
@@ -87,7 +87,7 @@ pub struct Command:
         try self.astring(encoded.view())
 
     ## Give the buffers back.
-    mutating func close():
+    func close():
         self.text.close()
         self.cuts.close()
 

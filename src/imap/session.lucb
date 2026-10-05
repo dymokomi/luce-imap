@@ -69,7 +69,7 @@ pub struct Session:
 
     ## Connect to `host`, read the greeting, upgrade with STARTTLS when `security` asks
     ## for it, and learn the capabilities.
-    pub static func open(host: str, port: u16, security: Security, timeout: u64 = default_timeout, cancellation: sync.Cancellation*? = none, trust: tls_stream.Trust = tls_stream.Trust()) -> Session!:
+    pub func open(host: str, port: u16, security: Security, timeout: u64 = default_timeout, cancellation: sync.Cancellation*? = none, trust: tls_stream.Trust = tls_stream.Trust()) -> Session!:
         let link = try Link.connect(host, port, security == Security.tls, timeout, cancellation, trust)
         var session = Session(link = link, selected = Selected(), collect = Collect.nothing)
         errdefer session.close()
@@ -86,14 +86,14 @@ pub struct Session:
         return session
 
     ## A session over an already connected, plain `link` (tests, proxies).
-    pub static func over(link: Link) -> Session!:
+    pub func over(link: Link) -> Session!:
         var session = Session(link = link, selected = Selected(), collect = Collect.nothing)
         errdefer session.close()
         try session.greet()
         return session
 
     ## Read the greeting; learn the capabilities if it did not name them.
-    mutating func greet() -> !:
+    func greet() -> !:
         let raw = try self.reader.read(&self.link)
         try self.response.parse(raw)
         if not self.response.is_untagged():
@@ -136,13 +136,13 @@ pub struct Session:
     # mark: running commands =====================================================================
 
     ## Run a command with no arguments that collects nothing.
-    mutating func simple(name: str) -> !:
+    func simple(name: str) -> !:
         self.command.clear()
         try self.command.raw(name)
         try self.run(Collect.nothing)
 
     ## Run the command in `self.command`, collecting `collect`, until its completion.
-    mutating func run(collect: Collect) -> !:
+    func run(collect: Collect) -> !:
         self.collect = collect
         self.command.literal_plus = self.has("LITERAL+")
         self.tag_number += 1
@@ -190,7 +190,7 @@ pub struct Session:
 
     ## Wait for the continuation request before a literal's bytes: true to send them,
     ## false when the command completed instead (it failed, which `complete` reports).
-    mutating func await_continuation(tag: const u8[]) -> bool!:
+    func await_continuation(tag: const u8[]) -> bool!:
         while true:
             let raw = try self.reader.read(&self.link)
             try self.response.parse(raw)
@@ -204,7 +204,7 @@ pub struct Session:
                 error(protocol, "the server completed a command before its literal")
 
     ## Finish the command whose tagged completion is the current response.
-    mutating func complete() -> !:
+    func complete() -> !:
         try self.code()
         self.collect = Collect.nothing
         match self.response.status:
@@ -218,7 +218,7 @@ pub struct Session:
             _: error(protocol, "a command completed without a status")
 
     ## Keep the current response's text in `last_text`, printable ASCII only.
-    mutating func keep_text() -> !:
+    func keep_text() -> !:
         self.last_text.clear()
         for byte in self.response.text:
             try self.last_text.byte(byte if byte >= 0x20 and byte < 0x7F else '?')
@@ -228,7 +228,7 @@ pub struct Session:
     # mark: untagged responses ===================================================================
 
     ## Take in the current untagged response.
-    mutating func absorb() -> !:
+    func absorb() -> !:
         let response = &self.response
         if response.status != Status.data:
             try self.code()
@@ -280,7 +280,7 @@ pub struct Session:
                 node = response.next(value)
 
     ## Replace the capabilities with the atoms in list `node`.
-    mutating func learn_capabilities(node: usize) -> !:
+    func learn_capabilities(node: usize) -> !:
         self.capabilities.clear()
         try self.capabilities.byte(' ')
         var current = self.response.first(node)
@@ -291,7 +291,7 @@ pub struct Session:
             current = self.response.next(value)
 
     ## Take in the current status response's code: `[UIDVALIDITY 3]`, `[CAPABILITY …]`.
-    mutating func code() -> !:
+    func code() -> !:
         let response = &self.response
         let code = response.code
         if code.length == 0:
@@ -337,7 +337,7 @@ pub struct Session:
         return self.changes.view()
 
     ## Forget the events.
-    pub mutating func take_events():
+    pub func take_events():
         self.expunged.clear()
         self.changes.clear()
         self.exists_changed = false
@@ -345,7 +345,7 @@ pub struct Session:
     # mark: login and logout =====================================================================
 
     ## Log in with a user name and password: SASL PLAIN when offered, LOGIN otherwise.
-    pub mutating func login(user: str, password: str) -> !:
+    pub func login(user: str, password: str) -> !:
         if self.authenticated:
             return
         if self.has("AUTH=PLAIN"):
@@ -371,7 +371,7 @@ pub struct Session:
         try self.after_login()
 
     ## Log in with an OAuth 2 access token (SASL XOAUTH2, as Gmail and Outlook use).
-    pub mutating func login_oauth(user: str, token: str) -> !:
+    pub func login_oauth(user: str, token: str) -> !:
         if not self.has("AUTH=XOAUTH2"):
             error(unsupported, "the server does not offer XOAUTH2")
         var answer: Bytes
@@ -384,7 +384,7 @@ pub struct Session:
         try self.authenticate("XOAUTH2", answer.view())
 
     ## Run AUTHENTICATE `mechanism` with the SASL answer `answer`.
-    mutating func authenticate(mechanism: str, answer: const u8[]) -> !:
+    func authenticate(mechanism: str, answer: const u8[]) -> !:
         self.command.clear()
         self.sasl.clear()
         try self.command.raw("AUTHENTICATE ")
@@ -405,7 +405,7 @@ pub struct Session:
             error(failure.code, failure.message)
         try self.after_login()
 
-    mutating func after_login() -> !:
+    func after_login() -> !:
         self.authenticated = true
         if self.capabilities.used == 0 or not self.has("IMAP4REV1") and not self.has("IMAP4REV2"):
             try self.simple("CAPABILITY")
@@ -414,18 +414,18 @@ pub struct Session:
 
     ## Ask the server for news (NOOP): new messages, expunges and flag changes arrive as
     ## events.
-    pub mutating func noop() -> !:
+    pub func noop() -> !:
         try self.simple("NOOP")
 
     ## Say goodbye and close the connection. Failures are ignored: the connection goes.
-    pub mutating func logout():
+    pub func logout():
         if self.link.is_open():
             self.simple("LOGOUT") catch failure:
                 recover ()
         self.close()
 
     ## Close the connection and give everything back.
-    pub mutating func close():
+    pub func close():
         self.link.close()
         self.reader.close()
         self.response.close()
@@ -442,7 +442,7 @@ pub struct Session:
         self.idle_tag.close()
 
     ## Forget the last command's results before a new one collects.
-    mutating func reset_results():
+    func reset_results():
         self.pool.close()
         self.mailbox_list.clear()
         self.message_list.clear()

@@ -65,7 +65,7 @@ pub struct MailboxStatus:
 extend Session:
     ## List every mailbox under `reference` matching `pattern` (`*` for all), with
     ## special-use roles when the server offers them.
-    pub mutating func list(reference: str = "", pattern: str = "*") -> const Mailbox[]!:
+    pub func list(reference: str = "", pattern: str = "*") -> const Mailbox[]!:
         self.reset_results()
         self.command.clear()
         try self.command.raw("LIST ")
@@ -82,7 +82,7 @@ extend Session:
         return self.mailbox_list.view()
 
     ## Take in a LIST response: `* LIST (\HasNoChildren) "/" "Sent Items"`.
-    mutating func read_list() -> !:
+    func read_list() -> !:
         let response = &self.response
         let attributes = response.at(response.values, 0) else error(protocol, "a LIST response without attributes")
         let delimiter_node = response.at(response.values, 1) else error(protocol, "a LIST response without a delimiter")
@@ -116,7 +116,7 @@ extend Session:
         try self.mailbox_list.add(Mailbox(name = name, path = kept_path, delimiter = delimiter, flags = flags))
 
     ## The counts of mailbox `name` (UTF-8), without selecting it.
-    pub mutating func status(name: str) -> MailboxStatus!:
+    pub func status(name: str) -> MailboxStatus!:
         self.reset_results()
         self.command.clear()
         try self.command.raw("STATUS ")
@@ -129,7 +129,7 @@ extend Session:
         return self.status_result
 
     ## Take in a STATUS response: `* STATUS INBOX (MESSAGES 3 UIDNEXT 4)`.
-    mutating func read_status():
+    func read_status():
         let response = &self.response
         let items = response.at(response.values, 1) else return
         var current = response.first(items)
@@ -152,21 +152,21 @@ extend Session:
             current = response.next(value)
 
     ## Create mailbox `name` (UTF-8).
-    pub mutating func create(name: str) -> !:
+    pub func create(name: str) -> !:
         self.command.clear()
         try self.command.raw("CREATE ")
         try self.command.mailbox(name.bytes)
         try self.run(Collect.nothing)
 
     ## Delete mailbox `name` (UTF-8).
-    pub mutating func delete(name: str) -> !:
+    pub func delete(name: str) -> !:
         self.command.clear()
         try self.command.raw("DELETE ")
         try self.command.mailbox(name.bytes)
         try self.run(Collect.nothing)
 
     ## Rename mailbox `current` to `renamed` (UTF-8).
-    pub mutating func rename(current: str, renamed: str) -> !:
+    pub func rename(current: str, renamed: str) -> !:
         self.command.clear()
         try self.command.raw("RENAME ")
         try self.command.mailbox(current.bytes)
