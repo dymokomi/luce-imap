@@ -19,7 +19,7 @@
 #       Fragments, in ORDER:
 #
 #       module.lucb      imports, error codes, limits
-#       buffer.lucb      Bytes: a growable byte buffer; Words: a growable u32 list
+#       buffer.lucb      decimal, base64 and ASCII case helpers over collections.Buffer
 #       link.lucb        Link: the connection, read and written under deadlines
 #       utf7.lucb        mailbox names in modified UTF-7 (RFC 3501 §5.1.3)
 #       response.lucb    one response read off the wire and parsed into values
@@ -32,6 +32,7 @@
 #
 #==============================================================================================
 
+from luce_std import collections
 import io
 import memory
 from luce_std import net

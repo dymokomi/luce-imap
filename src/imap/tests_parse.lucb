@@ -34,8 +34,8 @@ test "data responses: EXISTS, LIST, SEARCH, STATUS":
     assert(response.is("EXISTS") and response.number == 172)
     try parsed("* LIST (\\HasNoChildren \\Sent) \"/\" \"Sent Items\"\r\n", &response)
     assert(response.is("LIST") and response.count(response.values) == 3)
-    var name: Bytes
-    defer name.close()
+    var name: collections.Buffer
+    defer name.destroy()
     try response.string(response.at(response.values, 2) else trap("name"), &name)
     assert(equal(name.view(), b"Sent Items"))
     try parsed("* LIST () NIL INBOX\r\n", &response)
@@ -78,8 +78,8 @@ test "the literal marker at a line end":
     assert(literal_length(b"* OK fine\r\n") == none)
 
 test "modified UTF-7 mailbox names both ways":
-    var out: Bytes
-    defer out.close()
+    var out: collections.Buffer
+    defer out.destroy()
     try decode_mailbox(b"Entw&APw-rfe", &out)
     assert((str)out.view() == "Entwürfe")
     out.clear()
@@ -93,20 +93,20 @@ test "modified UTF-7 mailbox names both ways":
     assert((str)out.view() == "~peter/mail/&U,BTFw-/&ZeVnLIqe-")
     out.clear()
     try encode_mailbox("Fish & Chips 🐟".bytes, &out)
-    var back: Bytes
-    defer back.close()
+    var back: collections.Buffer
+    defer back.destroy()
     try decode_mailbox(out.view(), &back)
     assert((str)back.view() == "Fish & Chips 🐟")
 
 test "sequence sets, written and read":
-    var out: Bytes
-    defer out.close()
+    var out: collections.Buffer
+    defer out.destroy()
     try write_set([1u32, 2, 3, 4, 7, 9, 10], &out)
     assert((str)out.view() == "1:4,7,9:10")
-    var numbers: Words
-    defer numbers.close()
+    var numbers: collections.List[u32]
+    defer numbers.destroy()
     try add_set(b"4:6,9,12:11", &numbers)
-    assert(numbers.used == 6 and numbers.view()[3] == 9 and numbers.view()[5] == 12)
+    assert(numbers.length() == 6 and numbers.view()[3] == 9 and numbers.view()[5] == 12)
 
 test "internal dates":
     assert(read_internal_date(b"17-Jul-1996 02:44:25 -0700") == 837596665)
@@ -126,8 +126,8 @@ test "command arguments: atoms, quoted strings and literals":
     assert((str)command.text.view() == "INBOX \"Sent Items\" \"pa\\\"ss\" Entw&APw-rfe")
     command.clear()
     try command.string(b"line\r\nbreak")
-    assert((str)command.text.view() == "{11}\r\nline\r\nbreak" and command.cuts.used == 1)
+    assert((str)command.text.view() == "{11}\r\nline\r\nbreak" and command.cuts.length() == 1)
     command.clear()
     command.literal_plus = true
     try command.literal(b"abc")
-    assert((str)command.text.view() == "{3+}\r\nabc" and command.cuts.used == 0)
+    assert((str)command.text.view() == "{3+}\r\nabc" and command.cuts.length() == 0)

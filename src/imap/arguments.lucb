@@ -20,9 +20,9 @@ func is_atom_char(byte: u8) -> bool:
 
 ## A command being written: its text and where it pauses for the server.
 pub struct Command:
-    var text: Bytes
+    var text: collections.Buffer
     ## Offsets in `text` just after each synchronizing literal's `{n}` CRLF.
-    var cuts: Words
+    var cuts: collections.List[u32]
     ## The server offers LITERAL+ (or LITERAL-, used here only for small literals).
     var literal_plus: bool
     ## The server accepts UTF-8 in quoted strings (UTF8=ACCEPT enabled).
@@ -35,21 +35,21 @@ pub struct Command:
 
     ## Append protocol text as it is: command names, keywords, parenthesised items.
     pub func raw(text: str) -> !:
-        try self.text.text(text)
+        try self.text.put_text(text)
 
     ## Append a number.
     pub func number(value: u64) -> !:
-        try self.text.number(value)
+        try put_decimal(&self.text, value)
 
     ## Append `data` as a literal.
     pub func literal(data: const u8[]) -> !:
-        try self.text.byte('{')
-        try self.text.number((u64)data.length)
+        try self.text.put_byte('{')
+        try put_decimal(&self.text, (u64)data.length)
         if self.literal_plus:
             try self.text.put(b"+}\r\n")
         else:
             try self.text.put(b"}\r\n")
-            try self.cuts.add(u32(self.text.used))
+            try self.cuts.append(u32(self.text.length()))
         try self.text.put(data)
 
     ## Append `data` as a quoted string, or a literal when it cannot be one.
@@ -58,12 +58,12 @@ pub struct Command:
             if byte == 0 or byte == '\r' or byte == '\n' or (byte >= 0x80 and not self.utf8):
                 try self.literal(data)
                 return
-        try self.text.byte('"')
+        try self.text.put_byte('"')
         for byte in data:
             if byte == '"' or byte == '\\':
-                try self.text.byte('\\')
-            try self.text.byte(byte)
-        try self.text.byte('"')
+                try self.text.put_byte('\\')
+            try self.text.put_byte(byte)
+        try self.text.put_byte('"')
 
     ## Append `data` as an atom when it can be one, a string otherwise.
     pub func astring(data: const u8[]) -> !:
@@ -81,18 +81,18 @@ pub struct Command:
         if same(name, b"INBOX") or self.utf8:
             try self.astring(name)
             return
-        var encoded: Bytes
-        defer encoded.close()
+        var encoded: collections.Buffer
+        defer encoded.destroy()
         try encode_mailbox(name, &encoded)
         try self.astring(encoded.view())
 
     ## Give the buffers back.
     func close():
-        self.text.close()
-        self.cuts.close()
+        self.text.destroy()
+        self.cuts.destroy()
 
 ## Append ascending `values` as a compact sequence set: `1:4,7,9:10`.
-pub func write_set(values: const u32[], out: Bytes*) -> !:
+pub func write_set(values: const u32[], out: collections.Buffer*) -> !:
     var index: usize = 0
     var written = false
     while index < values.length:
@@ -102,10 +102,10 @@ pub func write_set(values: const u32[], out: Bytes*) -> !:
             index += 1
             last = values[index]
         if written:
-            try out.byte(',')
+            try out.put_byte(',')
         written = true
-        try out.number(first)
+        try put_decimal(out, first)
         if last != first:
-            try out.byte(':')
-            try out.number(last)
+            try out.put_byte(':')
+            try put_decimal(out, last)
         index += 1

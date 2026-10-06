@@ -96,16 +96,16 @@ extend Session:
             current = response.next(attribute)
         var delimiter: u8 = 0
         if response.kind(delimiter_node) == Kind.string:
-            var text: Bytes
-            defer text.close()
+            var text: collections.Buffer
+            defer text.destroy()
             try response.string(delimiter_node, &text)
-            if text.used == 1:
+            if text.length() == 1:
                 delimiter = text.view()[0]
-        var path: Bytes
-        defer path.close()
+        var path: collections.Buffer
+        defer path.destroy()
         try response.string(name_node, &path)
-        var shown: Bytes
-        defer shown.close()
+        var shown: collections.Buffer
+        defer shown.destroy()
         if self.command.utf8:
             try shown.put(path.view())
         else:
@@ -113,7 +113,7 @@ extend Session:
         let kept_path = try self.pool.keep(path.view())
         let kept_name = try self.pool.keep(shown.view())
         let name = (str)kept_name if utf8.valid(kept_name) else (str)kept_path
-        try self.mailbox_list.add(Mailbox(name = name, path = kept_path, delimiter = delimiter, flags = flags))
+        try self.mailbox_list.append(Mailbox(name = name, path = kept_path, delimiter = delimiter, flags = flags))
 
     ## The counts of mailbox `name` (UTF-8), without selecting it.
     pub func status(name: str) -> MailboxStatus!:

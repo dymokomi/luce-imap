@@ -21,10 +21,10 @@ extend Session:
             return false
         self.tag_number += 1
         self.idle_tag.clear()
-        try self.idle_tag.byte('a')
-        try self.idle_tag.number(self.tag_number)
-        var line: Bytes
-        defer line.close()
+        try self.idle_tag.put_byte('a')
+        try put_decimal(&self.idle_tag, self.tag_number)
+        var line: collections.Buffer
+        defer line.destroy()
         try line.put(self.idle_tag.view())
         try line.put(b" IDLE\r\n")
         try self.link.write(line.view())

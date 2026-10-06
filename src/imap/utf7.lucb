@@ -27,7 +27,7 @@ func utf7_value(byte: u8) -> u32?:
     return none
 
 ## Append the UTF-8 encoding of `scalar`.
-func put_scalar(scalar: u32, out: Bytes*) -> !:
+func put_scalar(scalar: u32, out: collections.Buffer*) -> !:
     var buffer: u8[4]
     let count = utf8.encode(scalar, buffer) else 0
     if count == 0:
@@ -37,9 +37,9 @@ func put_scalar(scalar: u32, out: Bytes*) -> !:
 
 ## Decode the base64 run `run` (between `&` and `-`) as UTF-16 onto `out`; false when
 ## it is not valid.
-func decode_run(run: const u8[], out: Bytes*) -> bool!:
-    var units: Words
-    defer units.close()
+func decode_run(run: const u8[], out: collections.Buffer*) -> bool!:
+    var units: collections.List[u32]
+    defer units.destroy()
     var bits: u32 = 0
     var held: u32 = 0
     for byte in run:
@@ -48,7 +48,7 @@ func decode_run(run: const u8[], out: Bytes*) -> bool!:
         held += 6
         if held >= 16:
             held -= 16
-            try units.add((bits >> held) & 0xFFFF)
+            try units.append((bits >> held) & 0xFFFF)
     var index: usize = 0
     let list = units.view()
     while index < list.length:
@@ -62,12 +62,12 @@ func decode_run(run: const u8[], out: Bytes*) -> bool!:
     return true
 
 ## Append mailbox name `name`, decoded from modified UTF-7, as UTF-8.
-pub func decode_mailbox(name: const u8[], out: Bytes*) -> !:
+pub func decode_mailbox(name: const u8[], out: collections.Buffer*) -> !:
     var index: usize = 0
     while index < name.length:
         let byte = name[index]
         if byte != '&':
-            try out.byte(byte)
+            try out.put_byte(byte)
             index += 1
             continue
         var end = index + 1
@@ -77,24 +77,24 @@ pub func decode_mailbox(name: const u8[], out: Bytes*) -> !:
             try out.put(name[index..])
             return
         if end == index + 1:
-            try out.byte('&')
+            try out.put_byte('&')
         elif not try decode_run(name[index + 1..<end], out):
             try out.put(name[index..<end + 1])
         index = end + 1
 
 ## Append the UTF-16 units of `scalar` to `units`.
-func add_units(scalar: u32, units: Words*) -> !:
+func add_units(scalar: u32, units: collections.List[u32]*) -> !:
     if scalar >= 0x10000:
         let rest = scalar - 0x10000
-        try units.add(0xD800 + (rest >> 10))
-        try units.add(0xDC00 + (rest & 0x3FF))
+        try units.append(0xD800 + (rest >> 10))
+        try units.append(0xDC00 + (rest & 0x3FF))
     else:
-        try units.add(scalar)
+        try units.append(scalar)
 
 ## Append the run of UTF-16 `units` in modified base64 between `&` and `-`.
-func encode_run(units: const u32[], out: Bytes*) -> !:
+func encode_run(units: const u32[], out: collections.Buffer*) -> !:
     let letters = utf7_alphabet.bytes
-    try out.byte('&')
+    try out.put_byte('&')
     var bits: u32 = 0
     var held: u32 = 0
     for code_unit in units:
@@ -102,27 +102,27 @@ func encode_run(units: const u32[], out: Bytes*) -> !:
         held += 16
         while held >= 6:
             held -= 6
-            try out.byte(letters[(bits >> held) & 63])
+            try out.put_byte(letters[(bits >> held) & 63])
         bits &= (1u32 << held) - 1
     if held > 0:
-        try out.byte(letters[(bits << (6 - held)) & 63])
-    try out.byte('-')
+        try out.put_byte(letters[(bits << (6 - held)) & 63])
+    try out.put_byte('-')
 
 ## Append UTF-8 mailbox name `name` in modified UTF-7.
-pub func encode_mailbox(name: const u8[], out: Bytes*) -> !:
-    var units: Words
-    defer units.close()
+pub func encode_mailbox(name: const u8[], out: collections.Buffer*) -> !:
+    var units: collections.List[u32]
+    defer units.destroy()
     var index: usize = 0
     while index < name.length:
         let byte = name[index]
         if byte >= 0x20 and byte <= 0x7E:
-            if units.used > 0:
+            if units.length() > 0:
                 try encode_run(units.view(), out)
                 units.clear()
             if byte == '&':
                 try out.put(b"&-")
             else:
-                try out.byte(byte)
+                try out.put_byte(byte)
             index += 1
             continue
         if let decoded = utf8.decode(name, index):
@@ -131,5 +131,5 @@ pub func encode_mailbox(name: const u8[], out: Bytes*) -> !:
         else:
             try add_units(0xFFFD, &units)
             index += 1
-    if units.used > 0:
+    if units.length() > 0:
         try encode_run(units.view(), out)

@@ -25,8 +25,8 @@ struct Script:
 
 ## Write `text` to `connection`, with `TAG` replaced by `tag`.
 func send_reply(connection: net.Connection*, text: str, tag: const u8[]) -> !:
-    var out: Bytes
-    defer out.close()
+    var out: collections.Buffer
+    defer out.destroy()
     let data = text.bytes
     var index: usize = 0
     while index < data.length:
@@ -34,7 +34,7 @@ func send_reply(connection: net.Connection*, text: str, tag: const u8[]) -> !:
             try out.put(tag)
             index += 3
             continue
-        try out.byte(data[index])
+        try out.put_byte(data[index])
         index += 1
     try io.write_all(connection, out.view())
 

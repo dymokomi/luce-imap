@@ -52,18 +52,18 @@ pub struct Fetched:
         return (self.flags & flag) != Flags.empty
 
 ## Append `flags` as a parenthesised flag list: `(\Seen \Flagged)`.
-pub func write_flags(flags: Flags, out: Bytes*) -> !:
-    try out.byte('(')
+pub func write_flags(flags: Flags, out: collections.Buffer*) -> !:
+    try out.put_byte('(')
     var first = true
     for entry in flag_names:
         if entry.1 == 32:
             continue
         if ((u16)flags & entry.1) != 0:
             if not first:
-                try out.byte(' ')
+                try out.put_byte(' ')
             first = false
-            try out.text(entry.0)
-    try out.byte(')')
+            try out.put_text(entry.0)
+    try out.put_byte(')')
 
 let month_abbreviations: str[12] = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"]
 
@@ -191,16 +191,16 @@ extend Session:
             elif same(name, b"RFC822.SIZE"):
                 fetched.size = response.number_of(value) else 0
             elif same(name, b"INTERNALDATE"):
-                var text: Bytes
-                defer text.close()
+                var text: collections.Buffer
+                defer text.destroy()
                 try response.string(value, &text)
                 fetched.internal_date = read_internal_date(text.view())
             elif same(name, b"MODSEQ"):
                 if let number = response.first(value):
                     fetched.modseq = response.number_of(number) else 0
             elif starts(name, b"BODY[") or starts(name, b"RFC822") or starts(name, b"BINARY["):
-                var data: Bytes
-                defer data.close()
+                var data: collections.Buffer
+                defer data.destroy()
                 try response.string(value, &data)
                 let kept = try self.pool.keep(data.view())
                 if contains_word(name, b"HEADER") or same(name, b"RFC822.HEADER"):
@@ -213,21 +213,21 @@ extend Session:
     ## The headers named in `fields` (`DATE FROM SUBJECT`), plus UID, flags, size and
     ## internal date, of the messages in UID set `set`: what a message list needs.
     pub func fetch_headers(set: str, fields: str) -> const Fetched[]!:
-        var items: Bytes
-        defer items.close()
+        var items: collections.Buffer
+        defer items.destroy()
         try items.put(b"(UID FLAGS RFC822.SIZE INTERNALDATE")
         if self.has("CONDSTORE"):
             try items.put(b" MODSEQ")
         try items.put(b" BODY.PEEK[HEADER.FIELDS (")
-        try items.text(fields)
+        try items.put_text(fields)
         try items.put(b")])")
         return try self.fetch(set, (str)items.view())
 
     ## The whole message with UID `uid`, without marking it seen; empty when it is gone.
     pub func fetch_message(uid: u32) -> const u8[]!:
-        var set: Bytes
-        defer set.close()
-        try set.number(uid)
+        var set: collections.Buffer
+        defer set.destroy()
+        try put_decimal(&set, uid)
         let records = try self.fetch((str)set.view(), "(UID BODY.PEEK[])")
         for record in records:
             if record.uid == uid:
@@ -248,7 +248,7 @@ extend Session:
             try self.command.raw("RETURN (ALL) ")
         try self.command.raw(criteria)
         try self.run(Collect.search)
-        sort(self.found.data[0..<self.found.used])
+        sort(self.found.items())
         return self.found.view()
 
     ## The UIDs of the messages whose header or body holds `text` (SEARCH TEXT), in
@@ -270,7 +270,7 @@ extend Session:
         try self.command.raw("TEXT ")
         try self.command.string(text.bytes)
         try self.run(Collect.search)
-        sort(self.found.data[0..<self.found.used])
+        sort(self.found.items())
         return self.found.view()
 
     ## Take in an ESEARCH response: `* ESEARCH (TAG "a5") UID ALL 4:19,21`.
@@ -357,7 +357,7 @@ func contains_word(name: const u8[], word: const u8[]) -> bool:
     return false
 
 ## Append the numbers of sequence set `text` (`4:7,9`) to `out`.
-func add_set(text: const u8[], out: Words*) -> !:
+func add_set(text: const u8[], out: collections.List[u32]*) -> !:
     var index: usize = 0
     while index < text.length:
         var first: u32 = 0
@@ -377,7 +377,7 @@ func add_set(text: const u8[], out: Words*) -> !:
             error(limit_exceeded, "a search result range is too large")
         var value = low
         while value <= high:
-            try out.add(value)
+            try out.append(value)
             value += 1
         index += 1
 

@@ -51,8 +51,7 @@ pub enum Status as u8:
 ## last until the next response is read.
 pub struct Response:
     var raw: const u8[]
-    var nodes: Node[]
-    var node_count: usize
+    var nodes: collections.List[Node]
     pub var tag: const u8[]
     pub var status: Status
     ## The number before the name in `* 23 EXISTS`.
@@ -83,16 +82,16 @@ pub struct Response:
 
     ## The kind of node `node`.
     pub func kind(node: usize) -> Kind:
-        return self.nodes[node].kind
+        return self.nodes.at(node).kind
 
     ## The first child of list `node`, or none.
     pub func first(node: usize) -> usize?:
-        let child = self.nodes[node].child
+        let child = self.nodes.at(node).child
         return none if child == 0 else (usize)child - 1
 
     ## The node after `node` in its list, or none.
     pub func next(node: usize) -> usize?:
-        let sibling = self.nodes[node].next
+        let sibling = self.nodes.at(node).next
         return none if sibling == 0 else (usize)sibling - 1
 
     ## The child at `index` of list `node`, or none.
@@ -108,16 +107,16 @@ pub struct Response:
 
     ## How many children list `node` has.
     pub func count(node: usize) -> usize:
-        return self.nodes[node].count
+        return self.nodes.at(node).count
 
     ## The bytes of an atom, number or string node; a quoted string as written, escapes
     ## and all (see `string`).
     pub func bytes(node: usize) -> const u8[]:
-        return self.raw[self.nodes[node].start..<self.nodes[node].end]
+        return self.raw[self.nodes.at(node).start..<self.nodes.at(node).end]
 
     ## Append string, atom or number `node`'s text, unescaped; NIL appends nothing.
-    pub func string(node: usize, out: Bytes*) -> !:
-        let entry = self.nodes[node]
+    pub func string(node: usize, out: collections.Buffer*) -> !:
+        let entry = self.nodes.at(node)
         if entry.kind == Kind.nil or entry.kind == Kind.list:
             return
         let data = self.raw[entry.start..<entry.end]
@@ -128,12 +127,12 @@ pub struct Response:
         while index < data.length:
             if data[index] == '\\' and index + 1 < data.length:
                 index += 1
-            try out.byte(data[index])
+            try out.put_byte(data[index])
             index += 1
 
     ## The value of a number node, or none for anything else.
     pub func number_of(node: usize) -> u64?:
-        if self.nodes[node].kind != Kind.number:
+        if self.nodes.at(node).kind != Kind.number:
             return none
         var value: u64 = 0
         for digit in self.bytes(node):
@@ -142,37 +141,28 @@ pub struct Response:
 
     ## Whether node `node` is the atom `name`, ignoring case.
     pub func is_atom(node: usize, name: str) -> bool:
-        return self.nodes[node].kind == Kind.atom and same(self.bytes(node), name.bytes)
+        return self.nodes.at(node).kind == Kind.atom and same(self.bytes(node), name.bytes)
 
     # mark: parsing ==============================================================================
 
     func add(kind: Kind, start: usize, end: usize) -> usize!:
-        if self.node_count == self.nodes.length:
-            if self.node_count >= maximum_nodes:
-                error(limit_exceeded, "the response has too many values")
-            let capacity: usize = 64 if self.nodes.length == 0 else self.nodes.length * 2
-            let grown = try new Node[capacity] --- in memory.heap
-            for index in 0..<self.node_count:
-                grown[index] = self.nodes[index]
-            if self.nodes.length > 0:
-                free(self.nodes) in memory.heap
-            self.nodes = grown
-        self.nodes[self.node_count] = Node(kind = kind, start = start, end = end, escaped = false, child = 0, next = 0, count = 0)
-        self.node_count += 1
-        return self.node_count - 1
+        if self.nodes.length() >= maximum_nodes:
+            error(limit_exceeded, "the response has too many values")
+        try self.nodes.append(Node(kind = kind, start = start, end = end, escaped = false, child = 0, next = 0, count = 0))
+        return self.nodes.length() - 1
 
     ## Make `child` the last child of list `list`, after `last` (none when it is first).
     func link(list: usize, last: usize?, child: usize):
         if let previous = last:
-            self.nodes[previous].next = u32(child + 1)
+            self.nodes.items()[previous].next = u32(child + 1)
         else:
-            self.nodes[list].child = u32(child + 1)
-        self.nodes[list].count += 1
+            self.nodes.items()[list].child = u32(child + 1)
+        self.nodes.items()[list].count += 1
 
     ## Parse `raw`, one whole response with its CRLF. Views point into `raw`.
     pub func parse(raw: const u8[]) -> !:
         self.raw = raw
-        self.node_count = 0
+        self.nodes.clear()
         self.status = Status.data
         self.number = none
         var empty: const u8[]
@@ -249,7 +239,7 @@ pub struct Response:
                 let child = try self.value(cursor, in_code)
                 self.link(list, last, child)
                 last = child
-            self.nodes[list].end = cursor.index
+            self.nodes.items()[list].end = cursor.index
             return list
         if byte == '"':
             cursor.index += 1
@@ -263,7 +253,7 @@ pub struct Response:
             if cursor.index >= cursor.data.length:
                 error(protocol, "a quoted string without its closing quote")
             let node = try self.add(Kind.string, start, cursor.index)
-            self.nodes[node].escaped = escaped
+            self.nodes.items()[node].escaped = escaped
             cursor.index += 1
             return node
         if byte == '{':
@@ -295,11 +285,7 @@ pub struct Response:
 
     ## Give the node table back.
     pub func close():
-        if self.nodes.length > 0:
-            free(self.nodes) in memory.heap
-        var empty: Node[]
-        self.nodes = empty
-        self.node_count = 0
+        self.nodes.destroy()
 
 ## The status named `name`, or none.
 func status_of(name: const u8[]) -> Status:
@@ -394,17 +380,17 @@ struct Cursor:
 
 ## Buffers what the link delivers and hands out whole responses.
 pub struct Reader:
-    var buffer: Bytes
+    var buffer: collections.Buffer
     ## Where the unread bytes start in the buffer.
     var start: usize
     ## The last response read: its line and literals.
-    var current: Bytes
+    var current: collections.Buffer
 
     ## Read one whole response from `link` into `current`.
     pub func read(link: Link*) -> const u8[]!:
         self.current.clear()
         while true:
-            let line_start = self.current.used
+            let line_start = self.current.length()
             try self.line(link)
             let line = self.current.view()[line_start..]
             # A line ending `{n}` or `{n+}` is followed by n bytes, then more line.
@@ -423,7 +409,7 @@ pub struct Reader:
             if index < data.length:
                 try self.current.put(data[self.start..<index + 1])
                 self.start = index + 1
-                if self.current.used > maximum_line + maximum_literal:
+                if self.current.length() > maximum_line + maximum_literal:
                     error(limit_exceeded, "the response is too long")
                 return
             searched = data.length - self.start
@@ -437,7 +423,7 @@ pub struct Reader:
             error(limit_exceeded, "a literal is larger than this client accepts")
         var remaining = count
         while remaining > 0:
-            let available = self.buffer.used - self.start
+            let available = self.buffer.length() - self.start
             if available == 0:
                 try self.fill(link)
                 continue
@@ -446,27 +432,25 @@ pub struct Reader:
             self.start += take
             remaining -= take
 
-    ## Read more from `link`, first moving the unread bytes to the front.
+    ## Read more from `link`, first dropping the bytes already handed out.
     func fill(link: Link*) -> !:
         if self.start > 0:
-            let unread = self.buffer.used - self.start
-            memory.move(self.buffer.data, self.buffer.data[self.start..], unread)
-            self.buffer.used = unread
+            self.buffer.remove(0, self.start)
             self.start = 0
-        try self.buffer.reserve(65536)
-        let count = try link.read(self.buffer.data[self.buffer.used..])
+        var chunk: u8[16384]
+        let count = try link.read(chunk[0..])
         if count == 0:
             error(disconnected, "the server closed the connection")
-        self.buffer.used += count
+        try self.buffer.put(chunk[0..<count])
 
     ## Whether bytes are waiting that were read but not handed out.
     pub func pending() -> bool:
-        return self.start < self.buffer.used
+        return self.start < self.buffer.length()
 
     ## Give the buffers back.
     pub func close():
-        self.buffer.close()
-        self.current.close()
+        self.buffer.destroy()
+        self.current.destroy()
         self.start = 0
 
 ## The length a line's trailing literal marker announces (`{12}` or `{12+}` before CRLF),
