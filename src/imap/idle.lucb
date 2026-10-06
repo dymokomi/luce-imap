@@ -38,7 +38,7 @@ extend Session:
             if self.response.is_untagged():
                 try self.absorb()
                 continue
-            if equal(self.response.tag, self.idle_tag.view()):
+            if self.response.tag == self.idle_tag.view():
                 try self.complete()
                 return false
 
@@ -73,7 +73,7 @@ extend Session:
             if self.response.is_untagged():
                 try self.absorb()
                 continue
-            if equal(self.response.tag, self.idle_tag.view()):
+            if self.response.tag == self.idle_tag.view():
                 try self.complete()
                 return
 

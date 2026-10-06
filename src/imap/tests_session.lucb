@@ -80,7 +80,7 @@ func serve(context: void*?):
                 tag_length = at
                 memory.copy(tag[0..<at], line[0..<at], at)
                 rest = line[at + 1..]
-        if rest.length < step.expect.length or not equal(rest[0..<step.expect.length], step.expect.bytes):
+        if rest.length < step.expect.length or rest[0..<step.expect.length] != step.expect.bytes:
             script.failure = step.expect
             return
         let consumed = stop + 1
@@ -139,14 +139,14 @@ test "a session lists, selects, fetches, searches, changes, appends and idles":
     let boxes = try session.list()
     assert(boxes.length == 3)
     assert(boxes[1].name == "Sent Items" and boxes[1].is(MailboxFlags.sent) and boxes[1].delimiter == '/')
-    assert(boxes[2].name == "Entwürfe" and equal(boxes[2].path, b"Entw&APw-rfe") and boxes[2].is(MailboxFlags.no_select))
+    assert(boxes[2].name == "Entwürfe" and boxes[2].path == b"Entw&APw-rfe" and boxes[2].is(MailboxFlags.no_select))
     let state = try session.select("INBOX")
     assert(state.exists == 3 and state.uid_validity == 1700 and state.uid_next == 12 and not state.read_only)
     assert(not session.has_events())
     let records = try session.fetch("1:*", "(UID FLAGS RFC822.SIZE INTERNALDATE BODY.PEEK[HEADER.FIELDS (SUBJECT)])")
     assert(records.length == 2)
     assert(records[0].uid == 4 and records[0].is(Flags.seen) and records[0].size == 100 and records[0].internal_date == 1790973266)
-    assert(equal(records[0].header, b"Subject: Hi\r\n\r\n") and equal(records[1].header, b"Subject: Yo"))
+    assert(records[0].header == b"Subject: Hi\r\n\r\n" and records[1].header == b"Subject: Yo")
     assert(records[1].has_flags and records[1].flags == Flags.empty)
     let unseen = try session.search("UNSEEN")
     assert(unseen.length == 4 and unseen[0] == 7 and unseen[3] == 11)
@@ -154,7 +154,7 @@ test "a session lists, selects, fetches, searches, changes, appends and idles":
     try session.move("9:11", "Sent Items")
     assert(session.expunges().length == 3 and session.selected.exists == 0)
     session.take_events()
-    assert(equal(try session.fetch_message(4), b"Subject: Hi\r\n\r\nYo\r\n"))
+    assert((try session.fetch_message(4)) == b"Subject: Hi\r\n\r\nYo\r\n")
     assert(try session.append("Entwürfe", b"hello", Flags.seen | Flags.draft) == 42)
     try session.noop()
     assert(session.has_events() and session.selected.exists == 6)

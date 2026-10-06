@@ -13,17 +13,17 @@ test "status responses with codes and text":
     defer response.close()
     try parsed("* OK [UIDVALIDITY 3857529045] UIDs valid\r\n", &response)
     assert(response.is_untagged() and response.status == Status.ok)
-    assert(equal(response.code, b"UIDVALIDITY"))
+    assert(response.code == b"UIDVALIDITY")
     assert(response.number_of(response.first(response.code_values) else trap("arg")) == 3857529045)
-    assert(equal(response.text, b"UIDs valid"))
+    assert(response.text == b"UIDs valid")
     try parsed("a7 NO [AUTHENTICATIONFAILED] Invalid credentials (Failure)\r\n", &response)
-    assert(equal(response.tag, b"a7") and response.status == Status.no)
-    assert(equal(response.code, b"AUTHENTICATIONFAILED"))
+    assert(response.tag == b"a7" and response.status == Status.no)
+    assert(response.code == b"AUTHENTICATIONFAILED")
     try parsed("* OK [PERMANENTFLAGS (\\Deleted \\Seen \\*)] Limited\r\n", &response)
     let flags = response.first(response.code_values) else trap("flags")
     assert(response.kind(flags) == Kind.list and response.count(flags) == 3)
     try parsed("+ idling\r\n", &response)
-    assert(response.is_continuation() and equal(response.text, b"idling"))
+    assert(response.is_continuation() and response.text == b"idling")
     try parsed("* BYE Autologout; idle for too long\r\n", &response)
     assert(response.status == Status.bye)
 
@@ -37,7 +37,7 @@ test "data responses: EXISTS, LIST, SEARCH, STATUS":
     var name: collections.Buffer
     defer name.destroy()
     try response.string(response.at(response.values, 2) else trap("name"), &name)
-    assert(equal(name.view(), b"Sent Items"))
+    assert(name.view() == b"Sent Items")
     try parsed("* LIST () NIL INBOX\r\n", &response)
     assert(response.kind(response.at(response.values, 1) else trap("nil")) == Kind.nil)
     try parsed("* SEARCH 2 84 882\r\n", &response)
@@ -45,7 +45,7 @@ test "data responses: EXISTS, LIST, SEARCH, STATUS":
     try parsed("* STATUS \"a \\\"b\\\"\" (MESSAGES 231 UIDNEXT 44292)\r\n", &response)
     name.clear()
     try response.string(response.at(response.values, 0) else trap("status name"), &name)
-    assert(equal(name.view(), b"a \"b\""))
+    assert(name.view() == b"a \"b\"")
 
 test "FETCH with sections, literals and NIL":
     var response: Response
@@ -55,9 +55,9 @@ test "FETCH with sections, literals and NIL":
     let items = response.first(response.values) else trap("items")
     assert(response.count(items) == 12)
     let section = response.at(items, 8) else trap("section")
-    assert(equal(response.bytes(section), b"BODY[HEADER.FIELDS (DATE FROM)]"))
+    assert(response.bytes(section) == b"BODY[HEADER.FIELDS (DATE FROM)]")
     let literal = response.at(items, 9) else trap("literal")
-    assert(response.kind(literal) == Kind.string and equal(response.bytes(literal), b"From: a@b.c\r\n"))
+    assert(response.kind(literal) == Kind.string and response.bytes(literal) == b"From: a@b.c\r\n")
     assert(response.kind(response.at(items, 11) else trap("nil")) == Kind.nil)
 
 test "malformed responses fail without crashing":

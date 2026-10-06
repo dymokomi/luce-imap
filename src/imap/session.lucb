@@ -183,7 +183,7 @@ pub struct Session:
             if self.response.is_untagged():
                 try self.absorb()
                 continue
-            if not equal(self.response.tag, tag.view()):
+            if self.response.tag != tag.view():
                 continue
             try self.complete()
             return
@@ -199,7 +199,7 @@ pub struct Session:
             if self.response.is_untagged():
                 try self.absorb()
                 continue
-            if equal(self.response.tag, tag):
+            if self.response.tag == tag:
                 try self.complete()
                 error(protocol, "the server completed a command before its literal")
 
@@ -449,12 +449,3 @@ pub struct Session:
         self.found.clear()
         self.status_result = MailboxStatus()
         self.appended = 0
-
-## Whether `a` and `b` hold the same bytes.
-func equal(a: const u8[], b: const u8[]) -> bool:
-    if a.length != b.length:
-        return false
-    for index in 0..<a.length:
-        if a[index] != b[index]:
-            return false
-    return true
