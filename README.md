@@ -52,7 +52,7 @@ caller reconnects.
 ## Test
 
 ```sh
-./test.sh          # parser tests and sessions against a scripted loopback server
+luc test           # parser tests and sessions against a scripted loopback server
 ```
 
 `dev/live.lucb` runs against a real server: `luce-base build dev/live.lucb
